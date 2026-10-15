@@ -32,7 +32,7 @@ from .config import Settings, language_base
 from .errors import ConfigError, V2SRTError
 from .media import Chunk, Media, plan_boundaries, split_wav
 from .proc import DaemonExecutor, ProcessGroup
-from .subtitle import Cue, CueCleaner, CueSequencer, OutputMode, SrtWriter, parse_srt
+from .subtitle import Cue, CueSequencer, OutputMode, SrtWriter, parse_srt
 from .timeutil import format_clock
 from .translator import GeminiTranslator
 from .ui import Reporter
@@ -41,8 +41,6 @@ from .whisper import Whisper
 log = logging.getLogger(__name__)
 
 CONTEXT_CUES = 8  # preceding cues sent along with every batch
-FLUSH_SECONDS = 45.0  # send a partial batch when whisper is slow ...
-FLUSH_MIN_CUES = 8  # ... and it has at least this many cues
 
 
 class OrderedSink:
@@ -257,41 +255,28 @@ class Pipeline:
         return OutputMode.BILINGUAL if self.settings.bilingual else OutputMode.TRANSLATED
 
     def _transcriber(self, chunk: Chunk, languages: dict[int, str]) -> Callable:
-        """A producer that streams one chunk through whisper and submits batches as they fill up."""
+        """A producer that recognizes one chunk and submits its cues to translation in batches.
+
+        A chunk's cues are released once the chunk is complete (main pass plus gap filling), so translation
+        overlaps with recognition chunk by chunk.
+        """
         whisper = self.whisper
         assert whisper is not None
-        batch_size = self.settings.batch_size
 
         def produce(submit: Callable[[list[Cue]], None], previous: deque) -> None:
-            cleaner = CueCleaner()
-            batch: list[Cue] = []
-            batch_started = 0.0
-
             def on_language(lang: str) -> None:
                 languages[chunk.index] = lang
                 if chunk.index == 0:
                     log.info("detected language: %s", lang)
 
-            for raw in whisper.transcribe(
+            cues = whisper.recognize(
                 chunk,
                 on_language=on_language,
                 on_progress=lambda pos: self.reporter.transcribe_progress(chunk.index, pos),
-            ):
-                cue = cleaner(raw)
-                if cue is None:
-                    continue
-                self.reporter.transcribe_progress(chunk.index, cue.end - chunk.start)
-                if not batch:
-                    batch_started = time.monotonic()
-                batch.append(cue)
-                if len(batch) >= batch_size or (
-                    len(batch) >= FLUSH_MIN_CUES and time.monotonic() - batch_started >= FLUSH_SECONDS
-                ):
-                    submit(batch)
-                    batch = []
-            if batch:
-                submit(batch)
+            )
             self.reporter.transcribe_progress(chunk.index, chunk.duration)
+            for batch in batched(cues, self.settings.batch_size):
+                submit(list(batch))
 
         return produce
 

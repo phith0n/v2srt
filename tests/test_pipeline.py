@@ -40,10 +40,12 @@ def video(tmp_path_factory) -> Path:
     return path
 
 
-def make_pipeline(tmp_path, *, translate=True, behaviour=None, **overrides):
+def make_pipeline(tmp_path, *, translate=True, behaviour=None, vad=False, **overrides):
     model = tmp_path / "ggml-fake.bin"
     model.write_bytes(b"0")
     options = dict(segment_ms=30_000, whisper_jobs=2, batch_size=4, translate_workers=3)
+    if vad:
+        options["vad_model"] = str(model)
     options.update(overrides)
     settings = Settings(whisper_model=str(model), gemini_api_key="k" if translate else None, **options)
     procs = ProcessGroup()
@@ -126,15 +128,15 @@ def test_interrupt_stops_quickly_and_keeps_partial(tmp_path, video, monkeypatch)
 
     import v2srt.pipeline as pipeline_module
 
-    monkeypatch.setenv("FAKE_WHISPER_DELAY", "0.5")
-    pipeline = make_pipeline(tmp_path, translate=False, segment_ms=0, batch_size=1)
+    monkeypatch.setenv("FAKE_WHISPER_DELAY", "0.05")  # ~0.25 s per 10 s chunk, many chunks still pending at 1.5 s
+    pipeline = make_pipeline(tmp_path, translate=False, segment_ms=10_000, whisper_jobs=1, batch_size=1)
     real_wait = pipeline_module._wait_all
     started = []
 
     def interrupted_wait(futures):
         if not started:
             started.append(time.monotonic())
-            time.sleep(1.5)  # let whisper produce a few cues
+            time.sleep(1.5)  # let the first chunks complete; cues are released chunk by chunk
             raise KeyboardInterrupt
         return real_wait(futures)
 
@@ -149,3 +151,21 @@ def test_interrupt_stops_quickly_and_keeps_partial(tmp_path, video, monkeypatch)
     partial = srt_texts(tmp_path / "clip.srt.part")
     assert partial and partial[0] == "Line 1 at 0"
     assert set(Path(pipeline_module.tempfile.gettempdir()).glob("v2srt-*")) == temp_dirs_before
+
+
+def test_gap_filling_in_pipeline(tmp_path, video, monkeypatch):
+    monkeypatch.setenv("FAKE_WHISPER_DROP", "3")
+    monkeypatch.setenv("FAKE_WHISPER_BACKCHANNEL", "1")
+    pipeline = make_pipeline(tmp_path, vad=True)
+    out = tmp_path / "clip.srt"
+    result = pipeline.run_media(video, out)
+
+    cues = parse_srt(out.read_text(encoding="utf-8"))
+    texts = [c.text for c in cues]
+    assert result.cues == len(cues) and result.untranslated == 0
+    assert any(t.startswith("T:Recovered ") for t in texts)  # recovered speech is translated like the rest
+    assert all(t.startswith(("T:Line ", "T:Recovered ")) for t in texts)  # no backchannel, nothing untranslated
+    assert len(texts) == len(set((c.start, c.text) for c in cues))  # no duplicates
+    starts = [c.start for c in cues]
+    assert starts == sorted(starts)
+    assert all(a.end <= b.start for a, b in zip(cues, cues[1:]))

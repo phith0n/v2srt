@@ -116,6 +116,8 @@ def build_run_parser(prog: str = "v2srt") -> argparse.ArgumentParser:
                    help="whisper-cli processes running in parallel (default 1)")  # fmt: skip
     g.add_argument("--threads", dest="whisper_threads", type=_positive_int, metavar="N", help="threads per whisper-cli")
     g.add_argument("--audio-track", type=_non_negative_int, metavar="N", help="audio track to use (0 = first)")
+    g.add_argument("--no-gap-fill", dest="gap_fill", action="store_false", default=None,
+                   help="do not re-transcribe speech that got no subtitles")  # fmt: skip
 
     g = p.add_argument_group("translation")
     g.add_argument("-t", "--to", dest="target_language", metavar="LANG",
