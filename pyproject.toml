@@ -1,0 +1,40 @@
+[project]
+name = "v2srt"
+version = "2.0.0"
+description = "Generate subtitles for any video with whisper.cpp and translate them with Gemini, streaming and in parallel."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "phith0n", email = "phith0n.ph2f@gmail.com" }
+]
+requires-python = ">=3.12"
+keywords = ["subtitles", "srt", "whisper", "whisper.cpp", "gemini", "translation"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "google-genai>=2.31.0",
+    "platformdirs>=4.13.0",
+    "python-dotenv>=1.2.4",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+v2srt = "v2srt:main"
+
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120

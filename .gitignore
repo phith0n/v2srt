@@ -1,7 +1,24 @@
-/venv/
+# python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# local configuration (contains API keys)
+.env
+
+# media and generated subtitles
 *.srt
+*.srt.part
 *.mp4
-*.wav
-*.json
+*.mkv
 *.avi
-/.idea/
+*.mov
+*.wav
+
+# editors
+.idea/
+.vscode/
