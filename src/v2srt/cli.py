@@ -30,6 +30,7 @@ from .timeutil import format_clock, parse_duration
 from .translator import GeminiTranslator
 from .ui import Reporter
 from .whisper import Whisper
+from .whisper_server import WhisperServer, resolve_whisper_server
 
 log = logging.getLogger("v2srt")
 console = Console(highlight=False)
@@ -295,7 +296,15 @@ def cmd_run(argv: Sequence[str]) -> int:
         _check_file(settings.whisper_model, "whisper model", "V2SRT_WHISPER_MODEL", "-m/--model")
         if settings.use_vad and settings.vad_model:
             _check_file(settings.vad_model, "VAD model", "V2SRT_VAD_MODEL", "--vad-model")
-        whisper = Whisper(settings, whisper_cli, procs)
+        server = None
+        if settings.gap_fill and settings.use_vad and settings.vad_model:
+            try:
+                server_exe = resolve_whisper_server(whisper_cli, settings.whisper_server)
+                server = WhisperServer(settings, server_exe, procs)
+                log.debug("whisper-server: %s", server_exe)
+            except V2SRTError as e:
+                log.warning("gap filling is disabled: %s", e)
+        whisper = Whisper(settings, whisper_cli, procs, server=server)
         log.debug("ffmpeg: %s | ffprobe: %s | whisper-cli: %s", media.ffmpeg, media.ffprobe, whisper_cli)
 
     translator = None
@@ -316,24 +325,28 @@ def cmd_run(argv: Sequence[str]) -> int:
     )  # fmt: skip
 
     failures = 0
-    for number, job in enumerate(jobs, 1):
-        counter = f"[{number}/{len(jobs)}] " if len(jobs) > 1 else ""
-        console.rule(f"{counter}{escape(job.src.name)}", style="dim")
-        log.debug("job %d/%d: %s -> %s", number, len(jobs), job.src, job.output)
-        try:
-            if job.kind == "srt":
-                result = pipeline.run_srt(job.src, job.output)
-            else:
-                result = pipeline.run_media(job.src, job.output)
-        except (Cancelled, KeyboardInterrupt):
-            raise
-        except (V2SRTError, OSError) as e:
-            failures += 1
-            log.debug("job failed", exc_info=True)
-            console.print(f"[bold red]failed:[/] {escape(str(e))}")
-            continue
-        log.debug("job done: %s", result)
-        print_result(result)
+    try:
+        for number, job in enumerate(jobs, 1):
+            counter = f"[{number}/{len(jobs)}] " if len(jobs) > 1 else ""
+            console.rule(f"{counter}{escape(job.src.name)}", style="dim")
+            log.debug("job %d/%d: %s -> %s", number, len(jobs), job.src, job.output)
+            try:
+                if job.kind == "srt":
+                    result = pipeline.run_srt(job.src, job.output)
+                else:
+                    result = pipeline.run_media(job.src, job.output)
+            except (Cancelled, KeyboardInterrupt):
+                raise
+            except (V2SRTError, OSError) as e:
+                failures += 1
+                log.debug("job failed", exc_info=True)
+                console.print(f"[bold red]failed:[/] {escape(str(e))}")
+                continue
+            log.debug("job done: %s", result)
+            print_result(result)
+    finally:
+        if whisper is not None:
+            whisper.close()
 
     if translator is not None and (translator.stats.requests or translator.stats.failed_cues):
         st = translator.stats
@@ -452,7 +465,12 @@ def cmd_check(argv: Sequence[str]) -> int:
             row(True, "ffprobe", resolve_ffprobe(ffmpeg, settings.ffprobe), "ffprobe")
         except V2SRTError as e:
             row(False, "ffprobe", str(e), "ffprobe")
-    tool("whisper-cli", settings.whisper_cli, "whisper-cli", "V2SRT_WHISPER_CLI", "whisper_cli")
+    whisper_cli = tool("whisper-cli", settings.whisper_cli, "whisper-cli", "V2SRT_WHISPER_CLI", "whisper_cli")
+    if whisper_cli:
+        try:
+            row(True, "whisper-server", resolve_whisper_server(whisper_cli, settings.whisper_server), "whisper_server")
+        except V2SRTError as e:
+            row(None, "whisper-server", f"{e} Gap filling will be skipped.", "whisper_server")
 
     for item, value, field_name, required in (
         ("whisper model", settings.whisper_model, "whisper_model", True),

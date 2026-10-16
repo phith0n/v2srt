@@ -17,9 +17,11 @@ from v2srt.subtitle import parse_srt
 from v2srt.translator import GeminiTranslator
 from v2srt.ui import Reporter
 from v2srt.whisper import Whisper
+from v2srt.whisper_server import WhisperServer
 
 FFMPEG = shutil.which("ffmpeg")
 FAKE_WHISPER = Path(__file__).with_name("fake_whisper.py")
+FAKE_SERVER = Path(__file__).with_name("fake_whisper_server.py")
 pytestmark = pytest.mark.skipif(FFMPEG is None, reason="ffmpeg is required")
 
 
@@ -50,7 +52,8 @@ def make_pipeline(tmp_path, *, translate=True, behaviour=None, vad=False, **over
     settings = Settings(whisper_model=str(model), gemini_api_key="k" if translate else None, **options)
     procs = ProcessGroup()
     media = Media(FFMPEG, resolve_ffprobe(FFMPEG, None), procs)
-    whisper = Whisper(settings, "unused", procs, command_prefix=[sys.executable, str(FAKE_WHISPER)])
+    server = WhisperServer(settings, "unused", procs, command_prefix=[sys.executable, str(FAKE_SERVER)])
+    whisper = Whisper(settings, "unused", procs, command_prefix=[sys.executable, str(FAKE_WHISPER)], server=server)
     translator = GeminiTranslator(settings, client=FakeClient(behaviour)) if translate else None
     console = Console(file=io.StringIO(), width=120)
     return Pipeline(settings, Reporter(console), procs=procs, media=media, whisper=whisper, translator=translator)
@@ -158,7 +161,10 @@ def test_gap_filling_in_pipeline(tmp_path, video, monkeypatch):
     monkeypatch.setenv("FAKE_WHISPER_BACKCHANNEL", "1")
     pipeline = make_pipeline(tmp_path, vad=True)
     out = tmp_path / "clip.srt"
-    result = pipeline.run_media(video, out)
+    try:
+        result = pipeline.run_media(video, out)
+    finally:
+        pipeline.whisper.close()
 
     cues = parse_srt(out.read_text(encoding="utf-8"))
     texts = [c.text for c in cues]

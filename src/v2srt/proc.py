@@ -28,15 +28,13 @@ class ProcessGroup:
         self._procs: set[subprocess.Popen] = set()
         self._lock = threading.Lock()
 
-    def _start(self, cmd: Sequence[str]) -> subprocess.Popen:
+    def _start(self, cmd: Sequence[str], stderr: int = subprocess.PIPE) -> subprocess.Popen:
         with self._lock:
             if self.cancelled.is_set():
                 raise Cancelled("cancelled")
             log.debug("run: %s", subprocess.list2cmdline(list(cmd)))
             try:
-                proc = subprocess.Popen(
-                    list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
+                proc = subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr)
             except OSError as e:
                 raise ToolError(f"failed to start {cmd[0]}: {e}") from None
             self._procs.add(proc)
@@ -108,6 +106,28 @@ class ProcessGroup:
 
     def run(self, cmd: Sequence[str], **kwargs) -> list[str]:
         return list(self.stream(cmd, **kwargs))
+
+    def spawn(
+        self, cmd: Sequence[str], *, on_line: Callable[[str], None] | None = None, name: str | None = None
+    ) -> subprocess.Popen:
+        """Start a long-running process (a server); stdout and stderr go to ``on_line``. End it with :meth:`stop`."""
+        name = name or str(cmd[0])
+        proc = self._start(cmd, stderr=subprocess.STDOUT)
+
+        def drain() -> None:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                if on_line is not None:
+                    try:
+                        on_line(_decode(raw))
+                    except Exception:
+                        log.exception("output handler failed")
+
+        threading.Thread(target=drain, name=f"{name}-output", daemon=True).start()
+        return proc
+
+    def stop(self, proc: subprocess.Popen) -> None:
+        self._release(proc)
 
 
 class DaemonExecutor:

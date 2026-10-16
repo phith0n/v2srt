@@ -5,13 +5,14 @@ from pathlib import Path
 import pytest
 
 from v2srt.config import Settings, language_base, language_name, settings_from_env, split_args
-from v2srt.errors import ConfigError
+from v2srt.errors import ConfigError, ToolError
 from v2srt.media import Chunk, plan_boundaries
 from v2srt.pipeline import OrderedSink
 from v2srt.proc import ProcessGroup
 from v2srt.subtitle import Cue, CueCleaner, CueSequencer, OutputMode, cue_body, max_display_ms, parse_srt
 from v2srt.timeutil import format_clock, format_srt_time, parse_duration
 from v2srt.whisper import ChunkInfo, Whisper, parse_segment_line, parse_vad_segment, plan_pieces, uncovered_speech
+from v2srt.whisper_server import WhisperServer, resolve_whisper_server
 
 
 @pytest.mark.parametrize(
@@ -111,15 +112,30 @@ def _fake_whisper(tmp_path, seconds: int, **settings) -> tuple[Whisper, Path]:
     model = tmp_path / "ggml-fake.bin"
     model.write_bytes(b"0")
     fake = Path(__file__).with_name("fake_whisper.py")
+    fake_server = Path(__file__).with_name("fake_whisper_server.py")
     options = dict(whisper_model=str(model), vad_model=str(model), use_vad=True) | settings
-    return Whisper(Settings(**options), "unused", ProcessGroup(), command_prefix=[sys.executable, str(fake)]), wav
+    procs = ProcessGroup()
+    server = WhisperServer(Settings(**options), "unused", procs, command_prefix=[sys.executable, str(fake_server)])
+    whisper = Whisper(
+        Settings(**options), "unused", procs, command_prefix=[sys.executable, str(fake)], server=server
+    )
+    return whisper, wav
 
 
 def test_recognize_fills_missed_speech(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_WHISPER_DROP", "3")  # every 3rd line is missing although VAD reports speech
     monkeypatch.setenv("FAKE_WHISPER_BACKCHANNEL", "1")
+    monkeypatch.setenv("FAKE_SERVER_LOG", str(tmp_path / "requests.log"))
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")  # requests to the local server must bypass proxies
     whisper, wav = _fake_whisper(tmp_path, 20)
-    cues = whisper.recognize(Chunk(0, 60_000, 80_000, wav))
+    try:
+        cues = whisper.recognize(Chunk(0, 60_000, 80_000, wav))
+        server_proc = whisper.server._proc
+        again = whisper.recognize(Chunk(1, 80_000, 100_000, wav))
+        assert whisper.server._proc is server_proc  # one server for the whole run
+    finally:
+        whisper.close()
+    assert server_proc.poll() is not None
 
     texts = [c.text for c in cues]
     main = [t for t in texts if t.startswith("Line ")]
@@ -131,13 +147,40 @@ def test_recognize_fills_missed_speech(tmp_path, monkeypatch):
     assert "うん、うん" not in texts  # backchannel from the gap pass is discarded
     starts = [c.start for c in cues]
     assert starts == sorted(starts) and all(60_000 <= c.start and c.end <= 80_000 for c in cues)
-    assert not (wav.parent / "gaps-000").exists()
+    assert [c.start - 20_000 for c in again] == starts
+    # every piece is a separate request with the chunk's language (the fake detects "en"), at most 30 s long
+    requests = (tmp_path / "requests.log").read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(requests) == 8 and all(r.startswith("en srt ") and int(r.split()[2]) <= 30_000 for r in requests)
 
 
 def test_recognize_without_gap_fill(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_WHISPER_DROP", "3")
     whisper, wav = _fake_whisper(tmp_path, 20, gap_fill=False)
     assert not any(c.text.startswith("Recovered") for c in whisper.recognize(Chunk(0, 0, 20_000, wav)))
+    assert whisper.server._proc is None  # never started
+
+
+def test_whisper_server_start_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_WHISPER_DROP", "3")
+    monkeypatch.setenv("FAKE_SERVER_FAIL", "1")
+    whisper, wav = _fake_whisper(tmp_path, 20)
+    with pytest.raises(ToolError, match="whisper-server exited with code 3 while starting:\nerror: failed to load"):
+        whisper.recognize(Chunk(0, 0, 20_000, wav))
+
+
+def test_resolve_whisper_server(tmp_path, monkeypatch):
+    exe = ".exe" if sys.platform == "win32" else ""
+    cli = tmp_path / f"whisper-cli{exe}"
+    cli.write_bytes(b"")
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(ToolError, match="cannot find whisper-server"):
+        resolve_whisper_server(str(cli), None)
+    (tmp_path / f"whisper-server{exe}").write_bytes(b"")
+    assert resolve_whisper_server(str(cli), None) == str(tmp_path / f"whisper-server{exe}")
+    other = tmp_path / "bin"
+    other.mkdir()
+    (other / f"whisper-server{exe}").write_bytes(b"")
+    assert resolve_whisper_server(str(cli), str(other)) == str(other / f"whisper-server{exe}")
 
 
 def test_parse_srt_lenient():

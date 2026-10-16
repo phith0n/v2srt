@@ -15,16 +15,16 @@ They are collected in :class:`ChunkInfo` so the caller can compare them with wha
 
 Gap filling: with VAD, whisper.cpp concatenates all speech of a chunk and decodes it as one stream, which is unstable
 on sparse speech — a chunk can come back nearly empty although VAD found plenty of speech. After the main
-pass, :meth:`Whisper.recognize` re-transcribes every speech region that no subtitle covers, each region as its own
-short file but all in a single whisper-cli call (the model is loaded once), and merges the results.
+pass, :meth:`Whisper.recognize` re-transcribes every speech region that no subtitle covers, each region on its own
+and without VAD, through a :class:`~v2srt.whisper_server.WhisperServer` that keeps the model loaded for the whole
+run, and merges the results.
 """
 
+import io
 import logging
 import re
-import shutil
 import wave
 from dataclasses import dataclass, field
-from itertools import batched
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -33,6 +33,7 @@ from .media import Chunk
 from .proc import ProcessGroup
 from .subtitle import Cue, CueCleaner, parse_srt
 from .timeutil import format_clock
+from .whisper_server import WhisperServer
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +42,6 @@ GAP_MERGE_MS = 1000  # uncovered regions closer than this are transcribed as one
 GAP_PIECE_MAX_MS = 30_000  # ... of at most this length (whisper's window)
 GAP_PAD_MS = 300  # audio added around each piece
 GAP_MIN_SPEECH_MS = 300  # pieces with less speech are breaths and clicks, not worth transcribing
-GAP_FILES_PER_CALL = 100  # keeps the Windows command line well below its length limit
 
 _SEGMENT_RE = re.compile(
     r"^\[(\d+):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d+):(\d{2}):(\d{2})[.,](\d{3})\]\s?(.*)$"
@@ -111,17 +111,41 @@ def plan_pieces(segments: list[tuple[int, int]], duration: int) -> list[tuple[in
     return pieces
 
 
+def _wav_bytes(params: tuple, frames: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setparams(params)
+        w.writeframes(frames)
+    return buf.getvalue()
+
+
 class Whisper:
-    def __init__(self, settings: Settings, executable: str, procs: ProcessGroup, command_prefix: list[str] | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        executable: str,
+        procs: ProcessGroup,
+        command_prefix: list[str] | None = None,
+        server: WhisperServer | None = None,
+    ):
         if not settings.whisper_model:
             raise ValueError("whisper model is required")
         self.settings = settings
         self.procs = procs
         self.prefix = command_prefix or [executable]
+        self.server = server  # for gap filling; without it gaps are left as they are
 
     @property
     def uses_vad(self) -> bool:
         return bool(self.settings.use_vad and self.settings.vad_model)
+
+    @property
+    def fills_gaps(self) -> bool:
+        return bool(self.settings.gap_fill and self.uses_vad and self.server)
+
+    def close(self) -> None:
+        if self.server is not None:
+            self.server.close()
 
     def command(self, wav: Path) -> list[str]:
         s = self.settings
@@ -133,19 +157,6 @@ class Whisper:
         if s.whisper_prompt:
             cmd += ["--prompt", s.whisper_prompt]
         cmd += [*s.whisper_args, "-f", str(wav)]
-        return cmd
-
-    def gap_command(self, wavs: list[Path], language: str) -> list[str]:
-        """Transcribe several short speech-only files in one process; each result goes to ``<file>.srt``."""
-        s = self.settings
-        cmd = [*self.prefix, "-m", s.whisper_model, "-l", language, "-osrt"]
-        if s.whisper_threads:
-            cmd += ["-t", str(s.whisper_threads)]
-        if s.whisper_prompt:
-            cmd += ["--prompt", s.whisper_prompt]
-        cmd += s.whisper_args
-        for wav in wavs:
-            cmd += ["-f", str(wav)]
         return cmd
 
     def recognize(
@@ -166,7 +177,7 @@ class Whisper:
         cleaner = CueCleaner(label=f"whisper[{chunk.index}]")
         stream = self.transcribe(chunk, on_language=language_found, on_progress=on_progress, info=info)
         cues = [cue for raw in stream if (cue := cleaner(raw)) is not None]
-        if not (self.settings.gap_fill and self.uses_vad and info.speech):
+        if not (self.fills_gaps and info.speech):
             return cues
 
         relative = [(c.start - chunk.start, c.end - chunk.start) for c in cues]
@@ -183,41 +194,20 @@ class Whisper:
         return sorted(cues + filled, key=lambda c: c.start)
 
     def _fill(self, chunk: Chunk, pieces: list[tuple[int, int]], language: str) -> list[Cue]:
-        workdir = chunk.path.parent / f"gaps-{chunk.index:03}"
-        workdir.mkdir(exist_ok=True)
-        try:
-            files: list[tuple[Path, int, int]] = []
-            with wave.open(str(chunk.path), "rb") as src:
-                rate = src.getframerate()
-                for n, (start, end) in enumerate(pieces):
-                    path = workdir / f"piece-{n:04}.wav"
-                    src.setpos(start * rate // 1000)
-                    with wave.open(str(path), "wb") as dst:
-                        dst.setparams(src.getparams())
-                        dst.writeframes(src.readframes((end - start) * rate // 1000))
-                    files.append((path, start, end))
-
-            for group in batched(files, GAP_FILES_PER_CALL):
-                cmd = self.gap_command([path for path, _, _ in group], language)
-                for line in self.procs.stream(cmd, name="whisper-cli"):
-                    if line.strip():
-                        log.debug("whisper[%d] gaps: %s", chunk.index, line)
-
-            cleaner = CueCleaner(label=f"whisper[{chunk.index}] gap", strict=True)
-            filled = []
-            for path, start, end in files:
-                srt = path.with_name(path.name + ".srt")
-                if not srt.exists():
-                    log.debug("whisper[%d] gaps: no output for %s", chunk.index, path.name)
-                    continue
-                for cue in parse_srt(srt.read_text(encoding="utf-8", errors="replace")):
+        assert self.server is not None
+        cleaner = CueCleaner(label=f"whisper[{chunk.index}] gap", strict=True)
+        filled = []
+        with wave.open(str(chunk.path), "rb") as src:
+            rate = src.getframerate()
+            for start, end in pieces:
+                src.setpos(start * rate // 1000)
+                audio = _wav_bytes(src.getparams(), src.readframes((end - start) * rate // 1000))
+                for cue in parse_srt(self.server.transcribe(audio, language=language)):
                     cue.start = chunk.start + start + min(cue.start, end - start)
                     cue.end = chunk.start + start + min(cue.end, end - start)
                     if (kept := cleaner(cue)) is not None:
                         filled.append(kept)
-            return filled
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        return filled
 
     def transcribe(
         self,

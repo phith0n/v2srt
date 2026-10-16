@@ -1,27 +1,25 @@
 """Stand-in for whisper-cli: prints one segment per 2 seconds of audio, like the real program does.
 
 With ``--vad`` it also reports one VAD speech segment per printed segment on stderr, in whisper.cpp's format.
-Several ``-f`` inputs are processed in order; ``-osrt`` additionally writes ``<input>.srt`` like whisper-cli.
+Gap filling goes to whisper-server instead, see ``fake_whisper_server.py``.
 
 Environment knobs:
 - FAKE_WHISPER_FAIL: exit with an error
 - FAKE_WHISPER_DELAY: seconds to sleep after every printed segment
 - FAKE_WHISPER_DROP=N: with --vad, do not print every N-th segment although VAD reports speech there
-- FAKE_WHISPER_BACKCHANNEL: without --vad (gap filling), also emit a short backchannel cue per file
 """
 
 import os
 import sys
 import time
 import wave
-from pathlib import Path
 
 
-def stamp(ms: int, sep: str = ".") -> str:
+def stamp(ms: int) -> str:
     h, rest = divmod(ms, 3_600_000)
     m, rest = divmod(rest, 60_000)
     s, ms = divmod(rest, 1000)
-    return f"{h:02}:{m:02}:{s:02}{sep}{ms:03}"
+    return f"{h:02}:{m:02}:{s:02}.{ms:03}"
 
 
 def transcribe(wav: str, args: list[str]) -> None:
@@ -47,15 +45,9 @@ def transcribe(wav: str, args: list[str]) -> None:
     cues = []
     for n, start in enumerate(starts, 1):
         end = min(start + 2000, duration)
-        if vad or "-osrt" not in args:
-            if vad and drop and n % drop == 0:
-                continue
-            text = "[BLANK_AUDIO]" if n == 2 else f"Line {n} at {start}"
-        else:
-            text = f"Recovered {Path(wav).stem} {n}"
-        cues.append((start, end, text))
-    if not vad and "-osrt" in args and os.environ.get("FAKE_WHISPER_BACKCHANNEL"):
-        cues.append((0, min(500, duration), "うん、うん"))
+        if vad and drop and n % drop == 0:
+            continue
+        cues.append((start, end, "[BLANK_AUDIO]" if n == 2 else f"Line {n} at {start}"))
 
     out = sys.stdout.buffer
     for start, end, text in cues:
@@ -63,10 +55,6 @@ def transcribe(wav: str, args: list[str]) -> None:
         out.flush()
         print(f"whisper_print_progress_callback: progress = {start * 100 // max(1, duration):3d}%", file=sys.stderr)
         time.sleep(float(os.environ.get("FAKE_WHISPER_DELAY", "0.005")))
-    if "-osrt" in args:
-        with open(wav + ".srt", "w", encoding="utf-8") as fh:
-            for i, (start, end, text) in enumerate(cues, 1):
-                fh.write(f"{i}\n{stamp(start, ',')} --> {stamp(end, ',')}\n{text}\n\n")
 
 
 def main() -> int:

@@ -21,7 +21,7 @@ v2srt 使用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在本地识
 |---|---|
 | [uv](https://docs.astral.sh/uv/) | Python 项目与依赖管理工具（会自动安装合适的 Python） |
 | [FFmpeg](https://ffmpeg.org/download.html) | 提取与切分音频，需要 `ffmpeg` 和 `ffprobe` |
-| [whisper.cpp](https://github.com/ggml-org/whisper.cpp/releases) | 使用其中的 `whisper-cli` 程序；Windows 有 NVIDIA 显卡建议下载 CUDA 版本 |
+| [whisper.cpp](https://github.com/ggml-org/whisper.cpp/releases) | 使用其中的 `whisper-cli`，补漏识别还会用到同一目录下的 `whisper-server`；Windows 有 NVIDIA 显卡建议下载 CUDA 版本 |
 | Whisper 模型 | 从 [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main) 下载，推荐 `ggml-large-v3-turbo.bin`（速度与准确率兼顾）；显存不足可选 `ggml-medium.bin` / `ggml-small.bin` |
 | VAD 模型（可选，推荐） | 从 [ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad/tree/main) 下载 Silero VAD 模型，可减少静音段的错误识别 |
 | Gemini API 密钥（可选） | 用于翻译，在 [Google AI Studio](https://aistudio.google.com/apikey) 获取；不配置则只生成原文字幕 |
@@ -136,6 +136,7 @@ v2srt --cut 1:00:00 2:00:00 long_video.mp4
 | `V2SRT_FFMPEG` | | `ffmpeg` | ffmpeg 路径、所在目录或命令名 |
 | `V2SRT_FFPROBE` | | 与 ffmpeg 同目录 | ffprobe 路径 |
 | `V2SRT_WHISPER_CLI` | | `whisper-cli` | whisper-cli 路径、所在目录或命令名 |
+| `V2SRT_WHISPER_SERVER` | | whisper-cli 同目录，其次 PATH | whisper-server 路径、所在目录或命令名，补漏识别使用 |
 | `V2SRT_WHISPER_MODEL` | `-m` | （必填） | whisper 模型文件 |
 | `V2SRT_VAD_MODEL` | `--vad-model` / `--no-vad` | | VAD 模型文件 |
 | `V2SRT_VAD_THRESHOLD` | | `0.3` | VAD 阈值，越低越容易判定为人声 |
@@ -143,10 +144,10 @@ v2srt --cut 1:00:00 2:00:00 long_video.mp4
 | `V2SRT_SEGMENT` | `--segment` | `20m` | 自动分段长度，`0` 表示不分段 |
 | `V2SRT_CUT` | `-c` / `--cut` | | 固定切分时间点 |
 | `V2SRT_WHISPER_JOBS` | `-j` | `1` | 并行的 whisper-cli 进程数 |
-| `V2SRT_GAP_FILL` | `--no-gap-fill` | `true` | 补漏识别（需要 VAD 模型） |
+| `V2SRT_GAP_FILL` | `--no-gap-fill` | `true` | 补漏识别（需要 VAD 模型和 whisper-server） |
 | `V2SRT_WHISPER_THREADS` | `--threads` | whisper 默认 | 每个 whisper-cli 的线程数 |
 | `V2SRT_WHISPER_PROMPT` | `--prompt` | | whisper 初始提示词（人名、术语） |
-| `V2SRT_WHISPER_ARGS` | | | 原样传给 whisper-cli 的额外参数，如 `--max-len 60 --split-on-word` |
+| `V2SRT_WHISPER_ARGS` | | | 原样传给 whisper-cli（和 whisper-server）的额外参数，如 `--max-len 60 --split-on-word` |
 | `V2SRT_GEMINI_API_KEY` | | | Gemini 密钥（也识别 `GEMINI_API_KEY`、`GOOGLE_API_KEY`） |
 | `V2SRT_GEMINI_MODEL` | `--gemini-model` | `gemini-3.8-flash` | 翻译模型 |
 | `V2SRT_GEMINI_THINKING` | `--thinking` | `low` | 思考级别：`default`/`minimal`/`low`/`medium`/`high` |
@@ -203,7 +204,7 @@ ffmpeg ─► 16kHz 音频 ─► 按静音点分段 ─► whisper-cli（可多
 ```
 
 - whisper-cli 每解码出一句就会输出到 stdout，v2srt 逐行解析；一个分段（约 20 分钟）识别完成后，整段字幕按批（默认 40 条）提交翻译，同时开始识别下一段。
-- **补漏识别**：开启 VAD 时，whisper.cpp 会把一个分段里的所有人声拼接后连续解码，人声稀疏时偶尔会整段漏识别。每个分段识别完后，v2srt 会找出 VAD 检测到人声、却没有任何字幕的片段，在一次 whisper-cli 调用中逐个单独识别（模型只加载一次），再合并回去。补出来的"嗯""是"这类附和、重复音节和常见套话幻觉会被丢弃。这一步只处理漏掉的片段，额外耗时通常不多。
+- **补漏识别**：开启 VAD 时，whisper.cpp 会把一个分段里的所有人声拼接后连续解码，人声稀疏时偶尔会整段漏识别。每个分段识别完后，v2srt 会找出 VAD 检测到人声、却没有任何字幕的片段，不开 VAD 逐个单独识别，再合并回去。补出来的"嗯""是"这类附和、重复音节和常见套话幻觉会被丢弃。这些片段交给一个常驻的 whisper-server 处理：它在第一次需要补漏时启动，整个运行期间只加载一次模型，运行结束时自动关闭。找不到 whisper-server 时会给出警告并跳过补漏。注意 whisper-server 与 whisper-cli 各自加载一份模型，显存占用约为两份。
 - 每批翻译都会附带前几句原文和已有译文作为上下文，保证人名与语气前后一致。
 - 翻译结果可能乱序返回，由有序汇合器按时间顺序写入文件。
 - 字幕先写入 `xxx.srt.part`，全部成功后才替换为 `xxx.srt`，不会留下半成品；失败或按 Ctrl+C 中断时会保留 `.part` 文件。
@@ -236,7 +237,7 @@ uv sync
 uv run pytest
 ```
 
-测试使用模拟的 whisper-cli 和 Gemini 客户端，需要本机安装 ffmpeg。
+测试使用模拟的 whisper-cli、whisper-server 和 Gemini 客户端，需要本机安装 ffmpeg。
 
 ## 📄 许可证
 

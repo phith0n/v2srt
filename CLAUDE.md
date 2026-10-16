@@ -29,7 +29,7 @@ Entry point `v2srt:main` → `cli.main`, which dispatches `run` (default), `init
 ```
 ffmpeg → audio.wav → split at silences (media.plan_boundaries/split_wav) → one chunk per segment
   Whisper.recognize per chunk (DaemonExecutor, settings.whisper_jobs): main whisper-cli pass with --vad,
-    stdout parsed line by line → CueCleaner → gap filling (whisper.py) → the chunk's cues, sorted
+    stdout parsed line by line → CueCleaner → gap filling (whisper.py, via whisper_server.py) → the chunk's cues, sorted
     → batches of batch_size, submitted once the chunk is complete
       → GeminiTranslator.translate (DaemonExecutor, settings.translate_workers)
         → OrderedSink → CueSequencer → Outputs (SrtWriter) → *.srt.part, renamed on success
@@ -38,7 +38,8 @@ ffmpeg → audio.wav → split at silences (media.plan_boundaries/split_wav) →
 Key invariants that span several files:
 
 - **Streaming**: whisper-cli prints each segment to stdout as `[hh:mm:ss.mmm --> hh:mm:ss.mmm]  text`; `Whisper.transcribe` yields cues while the process runs. Language detection, progress and the VAD speech segments (`ChunkInfo`) come from **stderr**, so never add `--no-prints`. Chunk-relative timestamps are offset by `chunk.start`. Translation overlaps recognition **per chunk**: `recognize` returns a chunk's complete cue list, so the pipeline never has to retract cues it already submitted.
-- **Gap filling** (`Whisper.recognize`, `V2SRT_GAP_FILL`): with `--vad`, whisper.cpp concatenates a chunk's speech and decodes it as one stream; on sparse speech it sometimes returns almost nothing for a whole chunk. After the main pass, VAD segments not touched by any kept cue (±`COVER_PAD_MS`, using capped ends) are grouped by `plan_pieces`, cut with `wave`, transcribed **without** VAD in one whisper-cli call with several `-f` and `-osrt` (model loaded once; results read from `<piece>.wav.srt`), cleaned with `CueCleaner(strict=True)` (drops backchannel, syllable loops, stock phrases) and merged. Changing this behaviour should be validated on real files with the uncovered-speech metric (VAD speech time without a cue).
+- **Gap filling** (`Whisper.recognize`, `V2SRT_GAP_FILL`): with `--vad`, whisper.cpp concatenates a chunk's speech and decodes it as one stream; on sparse speech it sometimes returns almost nothing for a whole chunk. After the main pass, VAD segments not touched by any kept cue (±`COVER_PAD_MS`, using capped ends) are grouped by `plan_pieces`, cut with `wave` into in-memory WAVs, transcribed **without** VAD by a long-running `WhisperServer` (one request per piece, `response_format=srt`), cleaned with `CueCleaner(strict=True)` (drops backchannel, syllable loops, stock phrases) and merged. Changing this behaviour should be validated on real files with the uncovered-speech metric (VAD speech time without a cue).
+- **whisper-server** (`whisper_server.py`): started lazily on the first gap, reused for the whole run, stopped by `Whisper.close()` in `cmd_run`'s `finally` (and by `ProcessGroup.cancel`). It must never get VAD requests: whisper-server keeps the previous VAD time mapping in its state and shifts the timestamps of later non-VAD requests (verified on the real binary), which is why the main pass stays on whisper-cli. It is started with `-bs 5 -bo 5` because its own defaults are greedy, unlike whisper-cli. Requests use an opener with an empty `ProxyHandler`, so `HTTP_PROXY` never captures 127.0.0.1. Without a whisper-server executable `cmd_run` logs a warning and gap filling is skipped (`Whisper.fills_gaps`).
 - **Ordering**: batches finish out of order. `OrderedSink` is keyed by `(chunk, batch)` and only advances to the next chunk after `finish_chunk(chunk, n_batches)`; every submitted batch must eventually be `put`, even on failure (see the `finally` in `translate_batch`), or the sink stalls.
 - **CueSequencer** holds back one cue to trim overlaps, so `flush()` must run before committing.
 - **Outputs** write to `<name>.srt.part` and `os.replace` on success; on failure/Ctrl+C the `.part` file is kept and reported.
@@ -69,7 +70,8 @@ Key invariants that span several files:
 
 ### Testing doubles
 
-- `tests/fake_whisper.py` imitates whisper-cli's stdout/stderr; tests inject it via `Whisper(..., command_prefix=[sys.executable, fake_whisper.py])`. Env vars `FAKE_WHISPER_FAIL` / `FAKE_WHISPER_DELAY` control it.
+- `tests/fake_whisper.py` imitates whisper-cli's stdout/stderr; tests inject it via `Whisper(..., command_prefix=[sys.executable, fake_whisper.py])`. Env vars `FAKE_WHISPER_FAIL` / `FAKE_WHISPER_DELAY` / `FAKE_WHISPER_DROP` control it.
+- `tests/fake_whisper_server.py` is a stdlib HTTP server answering `/inference` with SRT; inject it via `WhisperServer(..., command_prefix=[...])` and pass it as `Whisper(..., server=...)`. Tests that start it must call `whisper.close()`.
 - `tests/fakes.py` provides `FakeClient` (Gemini) whose `behaviour(call_number, cues)` callback can raise `api_error(...)` or return partial answers.
 
 ## Platform notes

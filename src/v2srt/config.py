@@ -165,6 +165,7 @@ class Settings:
     ffmpeg: str = "ffmpeg"
     ffprobe: str | None = None
     whisper_cli: str = "whisper-cli"
+    whisper_server: str | None = None  # None: next to whisper-cli, then PATH
     # speech recognition
     whisper_model: str | None = None
     vad_model: str | None = None
@@ -221,6 +222,7 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar("ffmpeg", ("V2SRT_FFMPEG",), _path),
     EnvVar("ffprobe", ("V2SRT_FFPROBE",), _optional_path),
     EnvVar("whisper_cli", ("V2SRT_WHISPER_CLI",), _path),
+    EnvVar("whisper_server", ("V2SRT_WHISPER_SERVER",), _optional_path),
     EnvVar("whisper_model", ("V2SRT_WHISPER_MODEL",), _optional_path),
     EnvVar("vad_model", ("V2SRT_VAD_MODEL",), _optional_path),
     EnvVar("vad_threshold", ("V2SRT_VAD_THRESHOLD",), _threshold),
@@ -320,6 +322,8 @@ ENV_TEMPLATE = """\
 V2SRT_FFMPEG=ffmpeg
 # V2SRT_FFPROBE=            # default: ffprobe next to ffmpeg, then PATH
 V2SRT_WHISPER_CLI=whisper-cli
+# whisper-server keeps the model loaded for gap filling (see V2SRT_GAP_FILL).
+# V2SRT_WHISPER_SERVER=     # default: whisper-server next to whisper-cli, then PATH
 
 # ------------------------------------------------------ speech recognition
 # ggml model from https://huggingface.co/ggerganov/whisper.cpp (required)
@@ -335,11 +339,12 @@ V2SRT_VAD_MODEL=
 # V2SRT_WHISPER_JOBS=1
 # With VAD, re-transcribe speech regions that got no subtitles (whisper sometimes drops
 # whole stretches of sparse speech). Short backchannel from this pass is discarded.
+# Needs whisper-server; without it gap filling is skipped with a warning.
 # V2SRT_GAP_FILL=true
 # V2SRT_WHISPER_THREADS=
 # Initial prompt, useful for names and jargon.
 # V2SRT_WHISPER_PROMPT=
-# Extra arguments passed to whisper-cli as-is, e.g. "--max-len 60 --split-on-word"
+# Extra arguments passed to whisper-cli (and whisper-server) as-is, e.g. "--max-len 60 --split-on-word"
 # V2SRT_WHISPER_ARGS=
 
 # ------------------------------------------------------------ translation
