@@ -176,6 +176,7 @@ class Settings:
     whisper_prompt: str | None = None
     whisper_args: list[str] = field(default_factory=list)
     segment_ms: int = 20 * 60_000
+    gap_fill: bool = True
     cut_ms: list[int] = field(default_factory=list)
     audio_track: int | None = None
     # translation
@@ -229,6 +230,7 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar("whisper_prompt", ("V2SRT_WHISPER_PROMPT",), _text),
     EnvVar("whisper_args", ("V2SRT_WHISPER_ARGS",), split_args),
     EnvVar("segment_ms", ("V2SRT_SEGMENT",), parse_duration),
+    EnvVar("gap_fill", ("V2SRT_GAP_FILL",), _bool),
     EnvVar("cut_ms", ("V2SRT_CUT",), _cuts),
     EnvVar("translate", ("V2SRT_TRANSLATE",), _bool),
     EnvVar("gemini_api_key", ("V2SRT_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"), _text, secret=True),
@@ -331,6 +333,9 @@ V2SRT_VAD_MODEL=
 # V2SRT_SEGMENT=20m
 # How many whisper-cli processes run in parallel on different segments.
 # V2SRT_WHISPER_JOBS=1
+# With VAD, re-transcribe speech regions that got no subtitles (whisper sometimes drops
+# whole stretches of sparse speech). Short backchannel from this pass is discarded.
+# V2SRT_GAP_FILL=true
 # V2SRT_WHISPER_THREADS=
 # Initial prompt, useful for names and jargon.
 # V2SRT_WHISPER_PROMPT=

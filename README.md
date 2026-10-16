@@ -5,7 +5,8 @@ v2srt 使用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在本地识
 ## ✨ 功能特点
 
 - **🎯 本地识别**：whisper.cpp 在本机运行，支持 GPU 加速，音频不上传到任何云服务
-- **⚡ 流式翻译**：whisper 每识别出一句就立即进入翻译队列，识别与翻译同时进行，无需等待识别全部结束
+- **⚡ 流式翻译**：长视频按分段识别，每段识别完立即进入翻译队列，识别与翻译同时进行，无需等待全部识别结束
+- **🩹 补漏识别**：whisper 在人声稀疏的片段偶尔会整段漏识别；v2srt 会找出"有人声却没有字幕"的片段单独再识别一次
 - **🧵 多线程并行**：多个 Gemini 请求并发翻译；长视频自动切段后可同时运行多个 whisper-cli 进程
 - **✂️ 智能分段**：长视频自动按约 20 分钟分段，切点对齐到附近的静音处，不会把一句话切成两半
 - **🌐 高质量翻译**：默认使用 `gemini-3.8-flash`，结构化 JSON 输出，携带上下文翻译，自动纠正语音识别错误
@@ -142,6 +143,7 @@ v2srt --cut 1:00:00 2:00:00 long_video.mp4
 | `V2SRT_SEGMENT` | `--segment` | `20m` | 自动分段长度，`0` 表示不分段 |
 | `V2SRT_CUT` | `-c` / `--cut` | | 固定切分时间点 |
 | `V2SRT_WHISPER_JOBS` | `-j` | `1` | 并行的 whisper-cli 进程数 |
+| `V2SRT_GAP_FILL` | `--no-gap-fill` | `true` | 补漏识别（需要 VAD 模型） |
 | `V2SRT_WHISPER_THREADS` | `--threads` | whisper 默认 | 每个 whisper-cli 的线程数 |
 | `V2SRT_WHISPER_PROMPT` | `--prompt` | | whisper 初始提示词（人名、术语） |
 | `V2SRT_WHISPER_ARGS` | | | 原样传给 whisper-cli 的额外参数，如 `--max-len 60 --split-on-word` |
@@ -200,7 +202,8 @@ ffmpeg ─► 16kHz 音频 ─► 按静音点分段 ─► whisper-cli（可多
                                    按原顺序整理 ─► 逐条写入 SRT
 ```
 
-- whisper-cli 每解码出一段就会输出到 stdout，v2srt 逐行解析，攒满一批（默认 40 条，或 whisper 较慢时 45 秒）立即提交翻译。
+- whisper-cli 每解码出一句就会输出到 stdout，v2srt 逐行解析；一个分段（约 20 分钟）识别完成后，整段字幕按批（默认 40 条）提交翻译，同时开始识别下一段。
+- **补漏识别**：开启 VAD 时，whisper.cpp 会把一个分段里的所有人声拼接后连续解码，人声稀疏时偶尔会整段漏识别。每个分段识别完后，v2srt 会找出 VAD 检测到人声、却没有任何字幕的片段，在一次 whisper-cli 调用中逐个单独识别（模型只加载一次），再合并回去。补出来的"嗯""是"这类附和、重复音节和常见套话幻觉会被丢弃。这一步只处理漏掉的片段，额外耗时通常不多。
 - 每批翻译都会附带前几句原文和已有译文作为上下文，保证人名与语气前后一致。
 - 翻译结果可能乱序返回，由有序汇合器按时间顺序写入文件。
 - 字幕先写入 `xxx.srt.part`，全部成功后才替换为 `xxx.srt`，不会留下半成品；失败或按 Ctrl+C 中断时会保留 `.part` 文件。
