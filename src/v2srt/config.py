@@ -324,12 +324,13 @@ V2SRT_WHISPER_CLI=whisper-cli
 # ------------------------------------------------------ speech recognition
 # ggml model from https://huggingface.co/ggerganov/whisper.cpp (required)
 V2SRT_WHISPER_MODEL=
-# Silero VAD model from https://huggingface.co/ggml-org/whisper-vad (optional, recommended)
+# Silero VAD model from https://huggingface.co/ggml-org/whisper-vad (optional, recommended).
+# Also used to find pauses for split points, with whisper-vad-speech-segments next to whisper-cli.
 V2SRT_VAD_MODEL=
 # V2SRT_VAD_THRESHOLD=0.3
 # Spoken language code (en, ja, zh, ...) or auto
 # V2SRT_LANGUAGE=auto
-# Long audio is split into segments of about this length at silent points; 0 disables.
+# Long audio is split into segments of about this length at pauses in speech; 0 disables.
 # V2SRT_SEGMENT=20m
 # How many whisper-cli processes run in parallel on different segments.
 # V2SRT_WHISPER_JOBS=1
