@@ -118,6 +118,10 @@ def build_run_parser(prog: str = "v2srt") -> argparse.ArgumentParser:
     g.add_argument("--audio-track", type=_non_negative_int, metavar="N", help="audio track to use (0 = first)")
     g.add_argument("--no-gap-fill", dest="gap_fill", action="store_false", default=None,
                    help="do not re-transcribe speech that got no subtitles")  # fmt: skip
+    g.add_argument("--normalize", action="store_true", default=None,
+                   help="boost quiet speech before recognition (experimental, off by default)")  # fmt: skip
+    g.add_argument("--no-normalize", dest="normalize", action="store_false", default=None,
+                   help="do not boost quiet speech")  # fmt: skip
 
     g = p.add_argument_group("translation")
     g.add_argument("-t", "--to", dest="target_language", metavar="LANG",
@@ -354,8 +358,9 @@ def print_plan(settings: Settings, translate: bool, transcribe: bool) -> None:
     if transcribe:
         model = Path(settings.whisper_model or "").name
         vad = "VAD" if settings.use_vad and settings.vad_model else "no VAD"
+        normalized = ", normalized audio" if settings.normalize else ""
         lang = settings.language if settings.language != "auto" else "auto-detect"
-        parts.append(f"whisper [bold]{escape(model)}[/] ({vad}, {lang})")
+        parts.append(f"whisper [bold]{escape(model)}[/] ({vad}{normalized}, {lang})")
     if translate:
         target = language_name(settings.target_language) or settings.target_language
         mode = ", bilingual" if settings.bilingual else ""
@@ -469,6 +474,7 @@ def cmd_check(argv: Sequence[str]) -> int:
     row(None, "language", settings.language, "language")
     seg = format_clock(settings.segment_ms) if settings.segment_ms else "off"
     row(None, "segments", f"{seg}, {settings.whisper_jobs} parallel job(s)", "segment_ms")
+    row(None, "normalize audio", "on" if settings.normalize else "off", "normalize")
 
     if not settings.gemini_api_key:
         row(None, "translation", "disabled (no API key)", "gemini_api_key")

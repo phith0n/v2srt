@@ -14,6 +14,19 @@ from .proc import ProcessGroup
 
 SAMPLE_RATE = 16_000
 
+# Loudness leveling for V2SRT_NORMALIZE. Silero VAD (whisper-cli --vad) misses quiet speech; amplifying quiet input by
+# up to +20 dB without clipping recovers much of it. dynaudnorm computes a capped gain per frame and smooths it over
+# neighbouring frames, which is predictable. Single-pass loudnorm has no measurement of the file and runs in its
+# dynamic mode, steering towards an integrated loudness target, so how much a quiet stretch gains is hard to foresee.
+#   m=10         gain capped at 10x (+20 dB): long silences and noise floors are not blown up without limit
+#   p=0.95       no frame is raised above a 0.95 peak, so the output does not clip
+#   f=200:g=11   200 ms frames, gain smoothed (minimum + Gaussian filter) over 11 frames, about 2.2 s. A quiet reply of
+#                a few seconds next to a loud speaker gets most of its own gain; with the defaults (500 ms x 31, about
+#                15 s) the loud speaker's lower gain would cover it. Faster gain changes are harmless for recognition.
+# Peak mode (no targetrms) only turns frames down when they peak above 0.95, so audio at normal levels is boosted or
+# left alone rather than leveled down to a target.
+NORMALIZE_FILTER = "dynaudnorm=f=200:g=11:p=0.95:m=10"
+
 
 def resolve_executable(value: str, name: str, env_var: str) -> str:
     """Find an executable given a path, a directory containing it, or a command name on PATH."""
@@ -94,14 +107,27 @@ class Media:
         cmd = [self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
         if audio_track is not None:
             cmd += ["-map", f"0:a:{audio_track}"]
-        cmd += [
-            "-vn", "-sn", "-dn",
-            "-af", "aresample=async=1",
-            "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le",
-            "-progress", "pipe:1", "-nostats",
-            str(dst),
-        ]  # fmt: skip
-        for line in self.procs.stream(cmd, name="ffmpeg"):
+        cmd += ["-vn", "-sn", "-dn", "-af", "aresample=async=1", *self._pcm_output(dst)]
+        self._run(cmd, on_progress)
+
+    def normalize_audio(self, src: Path, dst: Path, *, on_progress: Callable[[int], None] | None = None) -> None:
+        """Level the loudness of a wav written by :meth:`extract_audio` (see :data:`NORMALIZE_FILTER`)."""
+        cmd = [self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+        cmd += ["-af", NORMALIZE_FILTER, *self._pcm_output(dst)]
+        self._run(cmd, on_progress)
+
+    @staticmethod
+    def _pcm_output(dst: Path) -> list[str]:
+        return ["-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", "-progress", "pipe:1", "-nostats", str(dst)]
+
+    def _run(
+        self,
+        cmd: list[str],
+        on_progress: Callable[[int], None] | None,
+        on_stderr: Callable[[str], None] | None = None,
+    ) -> None:
+        """Run ffmpeg with ``-progress pipe:1`` and report the output position in ms."""
+        for line in self.procs.stream(cmd, on_stderr=on_stderr, name="ffmpeg"):
             key, _, value = line.partition("=")
             if key == "out_time_us" and on_progress and value.strip().isdigit():
                 on_progress(int(value) // 1000)
@@ -127,10 +153,7 @@ class Media:
             "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
             "-f", "null", "-progress", "pipe:1", "-nostats", "-",
         ]  # fmt: skip
-        for line in self.procs.stream(cmd, on_stderr=on_stderr, name="ffmpeg"):
-            key, _, value = line.partition("=")
-            if key == "out_time_us" and on_progress and value.strip().isdigit():
-                on_progress(int(value) // 1000)
+        self._run(cmd, on_progress, on_stderr)
         return silences
 
 

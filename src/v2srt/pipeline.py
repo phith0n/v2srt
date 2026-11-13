@@ -183,6 +183,15 @@ class Pipeline:
             if not s.cut_ms and s.segment_ms > 0 and duration > s.segment_ms * 1.25:
                 with self.reporter.stage("Silences", duration) as update:
                     silences = self.media.detect_silences(wav, on_progress=update)
+            if s.normalize:
+                # After silence detection: leveling lifts the noise in pauses as well, and the fixed
+                # silencedetect threshold is meant for the original levels. Only whisper gets the leveled audio.
+                leveled = tmp / "audio-norm.wav"
+                with self.reporter.stage("Normalizing", duration) as update:
+                    self.media.normalize_audio(wav, leveled, on_progress=update)
+                if not s.keep_temp:
+                    wav.unlink()
+                wav = leveled
             boundaries = plan_boundaries(duration, segment_ms=s.segment_ms, cut_ms=s.cut_ms, silences=silences)
             chunks = split_wav(wav, boundaries, tmp)
             if len(chunks) > 1:

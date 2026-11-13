@@ -1,7 +1,10 @@
 import io
+import itertools
+import math
 import shutil
 import subprocess
 import sys
+import wave
 from pathlib import Path
 
 import pytest
@@ -90,6 +93,57 @@ def test_split_points_are_in_silences(tmp_path, video):
     assert len(silences) >= 5
     for b in plan_boundaries(70_000, segment_ms=30_000, cut_ms=[], silences=silences):
         assert b % 10_000 in range(4_000, 5_000), b
+
+
+def _samples(wav: Path) -> list[int]:
+    from array import array
+
+    with wave.open(str(wav), "rb") as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16_000, 1, 2)
+        return array("h", w.readframes(w.getnframes())).tolist()
+
+
+def _rms(samples: list[int], start_s: float, end_s: float) -> float:
+    part = samples[int(start_s * 16_000) : int(end_s * 16_000)]
+    return math.sqrt(sum(x * x for x in part) / len(part))
+
+
+def test_normalize_boosts_quiet_audio_without_clipping_or_shifting(tmp_path):
+    src = tmp_path / "quiet-then-loud.wav"
+    # The sine source peaks at 1/8: 10 s at a 0.01 peak (-40 dBFS), then a 0.5 peak (-6 dBFS). 20.1 s is not a whole
+    # number of 200 ms frames, so a dropped or padded last frame would show.
+    subprocess.run(
+        [
+            FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=20.1",
+            "-af", "volume='if(lt(t,10),0.08,4)':eval=frame", str(src),
+        ],
+        check=True,
+    )  # fmt: skip
+    media = Media(FFMPEG, resolve_ffprobe(FFMPEG, None), ProcessGroup())
+    raw, leveled = tmp_path / "audio.wav", tmp_path / "audio-norm.wav"
+    media.extract_audio(src, raw)
+    media.normalize_audio(raw, leveled)
+    before, after = _samples(raw), _samples(leveled)
+
+    def gain_db(start_s: float, end_s: float) -> float:
+        return 20 * math.log10(_rms(after, start_s, end_s) / _rms(before, start_s, end_s))
+
+    assert abs(len(after) - len(before)) <= 160  # same length (10 ms tolerance): silences still line up
+    assert 15 < gain_db(3, 7) <= 20.5  # quiet audio is lifted by up to +20 dB
+    assert gain_db(12, 18) < 7  # loud audio only up to the 0.95 peak (+5.6 dB here)
+    assert max(abs(x) for x in after) <= 0.96 * 32768  # peaks stay below 0.95 (+ rounding): no clipping
+    # no time shift: the loud part still starts at 10 s
+    assert _rms(after, 9.6, 9.9) < 0.1 * _rms(after, 10.1, 10.4)
+
+
+def test_transcribe_with_normalized_audio(tmp_path, video):
+    pipeline = make_pipeline(tmp_path, translate=False, normalize=True)
+    out = tmp_path / "clip.srt"
+    result = pipeline.run_media(video, out)
+    cues = parse_srt(out.read_text(encoding="utf-8"))
+    assert result.cues == len(cues) > 20
+    assert all(a.end <= b.start for a, b in itertools.pairwise(cues))
+    assert cues[-1].end <= 70_100
 
 
 def test_transcribe_only(tmp_path, video):
