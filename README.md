@@ -139,6 +139,10 @@ v2srt --cut 1:00:00 2:00:00 long_video.mp4
 | `V2SRT_WHISPER_MODEL` | `-m` | （必填） | whisper 模型文件 |
 | `V2SRT_VAD_MODEL` | `--vad-model` / `--no-vad` | | VAD 模型文件 |
 | `V2SRT_VAD_THRESHOLD` | | `0.3` | VAD 阈值，越低越容易判定为人声 |
+| `V2SRT_VAD_MIN_SPEECH_MS` | `--vad-min-speech` | whisper 默认（250） | 短于此时长（毫秒）的人声忽略 |
+| `V2SRT_VAD_MIN_SILENCE_MS` | `--vad-min-silence` | whisper 默认（100） | 停顿达到此时长（毫秒）才结束一段人声；调大可让一句话不被换气打断（需 whisper-cli 1.8.1 及以上） |
+| `V2SRT_VAD_MAX_SPEECH_S` | `--vad-max-speech` | 不限 | 超过此时长（整秒）的人声段在停顿处切开（间隔不足 0.2 秒的部分会被 whisper.cpp 重新合并，所以不是硬上限）；长篇独白可设为 `30` 左右，让每段接近 whisper 的 30 秒窗口，补漏识别也能定位长段中漏掉的句子 |
+| `V2SRT_VAD_SPEECH_PAD_MS` | `--vad-speech-pad` | whisper 默认（30） | 每段人声前后多保留的音频（毫秒）；调大可避免首尾字被截断 |
 | `V2SRT_LANGUAGE` | `-l` | `auto` | 语音语言 |
 | `V2SRT_SEGMENT` | `--segment` | `20m` | 自动分段长度，`0` 表示不分段 |
 | `V2SRT_CUT` | `-c` / `--cut` | | 固定切分时间点 |

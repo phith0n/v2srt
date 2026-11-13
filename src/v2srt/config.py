@@ -8,6 +8,7 @@ Precedence, highest first:
 4. built-in defaults
 """
 
+import math
 import os
 import shlex
 import sys
@@ -134,6 +135,27 @@ def _threshold(value: str) -> float:
     return v
 
 
+def vad_ms(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise ValueError(f"expected whole milliseconds, got {value.strip()!r}") from None
+    if n < 0:
+        raise ValueError(f"must not be negative, got {n}")
+    return n
+
+
+def vad_max_speech(value: str) -> float:
+    try:
+        v = float(value)
+    except ValueError:
+        raise ValueError(f"expected seconds, got {value.strip()!r}") from None
+    # whisper.cpp drops the fractional part, and 0 seconds would mean "no limit" there
+    if not (math.isfinite(v) and v >= 1):
+        raise ValueError(f"must be at least 1 second, got {value.strip()!r}")
+    return v
+
+
 def _thinking(value: str) -> str:
     v = value.strip().lower() or "default"
     if v not in ("default", "minimal", "low", "medium", "high"):
@@ -170,6 +192,11 @@ class Settings:
     vad_model: str | None = None
     vad_threshold: float = 0.3
     use_vad: bool = True
+    # whisper.cpp VAD tuning; None: the flag is not passed and whisper-cli's default applies
+    vad_min_speech_ms: int | None = None
+    vad_min_silence_ms: int | None = None
+    vad_max_speech_s: float | None = None
+    vad_speech_pad_ms: int | None = None
     language: str = "auto"
     whisper_threads: int | None = None
     whisper_jobs: int = 1
@@ -224,6 +251,10 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar("whisper_model", ("V2SRT_WHISPER_MODEL",), _optional_path),
     EnvVar("vad_model", ("V2SRT_VAD_MODEL",), _optional_path),
     EnvVar("vad_threshold", ("V2SRT_VAD_THRESHOLD",), _threshold),
+    EnvVar("vad_min_speech_ms", ("V2SRT_VAD_MIN_SPEECH_MS",), vad_ms),
+    EnvVar("vad_min_silence_ms", ("V2SRT_VAD_MIN_SILENCE_MS",), vad_ms),
+    EnvVar("vad_max_speech_s", ("V2SRT_VAD_MAX_SPEECH_S",), vad_max_speech),
+    EnvVar("vad_speech_pad_ms", ("V2SRT_VAD_SPEECH_PAD_MS",), vad_ms),
     EnvVar("language", ("V2SRT_LANGUAGE",), lambda v: v.strip() or "auto"),
     EnvVar("whisper_threads", ("V2SRT_WHISPER_THREADS",), _positive_int),
     EnvVar("whisper_jobs", ("V2SRT_WHISPER_JOBS",), _positive_int),
@@ -327,6 +358,20 @@ V2SRT_WHISPER_MODEL=
 # Silero VAD model from https://huggingface.co/ggml-org/whisper-vad (optional, recommended)
 V2SRT_VAD_MODEL=
 # V2SRT_VAD_THRESHOLD=0.3
+# VAD tuning, passed to whisper-cli only when set (unset: whisper.cpp's default in brackets).
+# Speech shorter than this is ignored [250].
+# V2SRT_VAD_MIN_SPEECH_MS=
+# A pause must last this long to end a speech region [100]. Larger values keep sentences
+# together instead of cutting them at short breaths. Needs whisper-cli 1.8.1 or newer.
+# V2SRT_VAD_MIN_SILENCE_MS=
+# Split speech regions longer than this many whole seconds at a pause [no limit]. Not a hard
+# limit: whisper.cpp rejoins parts separated by less than 0.2 s. Useful for long monologues,
+# e.g. 30: regions stay near whisper's 30 s window and gap filling can spot a missed
+# sentence inside a long stretch of speech.
+# V2SRT_VAD_MAX_SPEECH_S=
+# Audio kept before and after each speech region [30]. More padding avoids clipped
+# first and last words.
+# V2SRT_VAD_SPEECH_PAD_MS=
 # Spoken language code (en, ja, zh, ...) or auto
 # V2SRT_LANGUAGE=auto
 # Long audio is split into segments of about this length at silent points; 0 disables.
