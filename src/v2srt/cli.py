@@ -29,6 +29,7 @@ from .proc import ProcessGroup
 from .timeutil import format_clock, parse_duration
 from .translator import GeminiTranslator
 from .ui import Reporter
+from .vad import VAD_TOOL, SpeechDetector, find_vad_tool
 from .whisper import Whisper
 
 log = logging.getLogger("v2srt")
@@ -287,7 +288,7 @@ def cmd_run(argv: Sequence[str]) -> int:
     log_run_header(config)
 
     procs = ProcessGroup()
-    media = whisper = None
+    media = whisper = speech = None
     if any(j.kind == "media" for j in jobs):
         ffmpeg = resolve_executable(settings.ffmpeg, "ffmpeg", "V2SRT_FFMPEG")
         media = Media(ffmpeg, resolve_ffprobe(ffmpeg, settings.ffprobe), procs)
@@ -297,6 +298,13 @@ def cmd_run(argv: Sequence[str]) -> int:
             _check_file(settings.vad_model, "VAD model", "V2SRT_VAD_MODEL", "--vad-model")
         whisper = Whisper(settings, whisper_cli, procs)
         log.debug("ffmpeg: %s | ffprobe: %s | whisper-cli: %s", media.ffmpeg, media.ffprobe, whisper_cli)
+        if whisper.uses_vad:
+            vad_tool = find_vad_tool(whisper_cli)
+            if vad_tool:
+                speech = SpeechDetector(settings, vad_tool, procs)
+                log.debug("%s: %s", VAD_TOOL, vad_tool)
+            else:
+                log.debug("%s not found next to whisper-cli; long files are split at silences", VAD_TOOL)
 
     translator = None
     if settings.translation_enabled:
@@ -312,7 +320,7 @@ def cmd_run(argv: Sequence[str]) -> int:
     print_plan(settings, translator is not None, whisper is not None)
     pipeline = Pipeline(
         settings, Reporter(console, show_cues=not args.quiet),
-        procs=procs, media=media, whisper=whisper, translator=translator,
+        procs=procs, media=media, whisper=whisper, translator=translator, speech=speech,
     )  # fmt: skip
 
     failures = 0
@@ -452,7 +460,10 @@ def cmd_check(argv: Sequence[str]) -> int:
             row(True, "ffprobe", resolve_ffprobe(ffmpeg, settings.ffprobe), "ffprobe")
         except V2SRTError as e:
             row(False, "ffprobe", str(e), "ffprobe")
-    tool("whisper-cli", settings.whisper_cli, "whisper-cli", "V2SRT_WHISPER_CLI", "whisper_cli")
+    whisper_cli = tool("whisper-cli", settings.whisper_cli, "whisper-cli", "V2SRT_WHISPER_CLI", "whisper_cli")
+    if whisper_cli:
+        vad_tool = find_vad_tool(whisper_cli)
+        row(None, "VAD tool", vad_tool or "not found (long files are split at silences found by ffmpeg)")
 
     for item, value, field_name, required in (
         ("whisper model", settings.whisper_model, "whisper_model", True),

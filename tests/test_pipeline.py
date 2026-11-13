@@ -16,10 +16,12 @@ from v2srt.proc import ProcessGroup
 from v2srt.subtitle import parse_srt
 from v2srt.translator import GeminiTranslator
 from v2srt.ui import Reporter
+from v2srt.vad import SpeechDetector
 from v2srt.whisper import Whisper
 
 FFMPEG = shutil.which("ffmpeg")
 FAKE_WHISPER = Path(__file__).with_name("fake_whisper.py")
+FAKE_VAD = Path(__file__).with_name("fake_vad.py")
 pytestmark = pytest.mark.skipif(FFMPEG is None, reason="ffmpeg is required")
 
 
@@ -52,8 +54,11 @@ def make_pipeline(tmp_path, *, translate=True, behaviour=None, vad=False, **over
     media = Media(FFMPEG, resolve_ffprobe(FFMPEG, None), procs)
     whisper = Whisper(settings, "unused", procs, command_prefix=[sys.executable, str(FAKE_WHISPER)])
     translator = GeminiTranslator(settings, client=FakeClient(behaviour)) if translate else None
+    speech = SpeechDetector(settings, "unused", procs, command_prefix=[sys.executable, str(FAKE_VAD)]) if vad else None
     console = Console(file=io.StringIO(), width=120)
-    return Pipeline(settings, Reporter(console), procs=procs, media=media, whisper=whisper, translator=translator)
+    return Pipeline(
+        settings, Reporter(console), procs=procs, media=media, whisper=whisper, translator=translator, speech=speech
+    )
 
 
 def test_transcribe_and_translate(tmp_path, video):
@@ -89,6 +94,21 @@ def test_split_points_are_in_silences(tmp_path, video):
     silences = pipeline.media.detect_silences(wav)
     assert len(silences) >= 5
     for b in plan_boundaries(70_000, segment_ms=30_000, cut_ms=[], silences=silences):
+        assert b % 10_000 in range(4_000, 5_000), b
+
+
+def test_split_points_from_vad(tmp_path, video, monkeypatch):
+    from v2srt.media import plan_boundaries
+
+    # the fake VAD calls everything louder than the threshold speech; lavfi's sine has an amplitude of 1/8
+    pipeline = make_pipeline(tmp_path, vad=True, vad_threshold=0.05)
+    monkeypatch.setattr(pipeline.media, "detect_silences", lambda *a, **k: pytest.fail("used silencedetect"))
+    wav = tmp_path / "a.wav"
+    pipeline.media.extract_audio(video, wav)
+    with pipeline.reporter.job():
+        pauses = pipeline._pauses(wav, 70_000)
+    assert len(pauses) >= 6
+    for b in plan_boundaries(70_000, segment_ms=30_000, cut_ms=[], silences=pauses):
         assert b % 10_000 in range(4_000, 5_000), b
 
 
@@ -156,7 +176,7 @@ def test_interrupt_stops_quickly_and_keeps_partial(tmp_path, video, monkeypatch)
 def test_gap_filling_in_pipeline(tmp_path, video, monkeypatch):
     monkeypatch.setenv("FAKE_WHISPER_DROP", "3")
     monkeypatch.setenv("FAKE_WHISPER_BACKCHANNEL", "1")
-    pipeline = make_pipeline(tmp_path, vad=True)
+    pipeline = make_pipeline(tmp_path, vad=True, vad_threshold=0.05)  # split at pauses found by the fake VAD
     out = tmp_path / "clip.srt"
     result = pipeline.run_media(video, out)
 

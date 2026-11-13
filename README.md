@@ -8,7 +8,7 @@ v2srt 使用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在本地识
 - **⚡ 流式翻译**：长视频按分段识别，每段识别完立即进入翻译队列，识别与翻译同时进行，无需等待全部识别结束
 - **🩹 补漏识别**：whisper 在人声稀疏的片段偶尔会整段漏识别；v2srt 会找出"有人声却没有字幕"的片段单独再识别一次
 - **🧵 多线程并行**：多个 Gemini 请求并发翻译；长视频自动切段后可同时运行多个 whisper-cli 进程
-- **✂️ 智能分段**：长视频自动按约 20 分钟分段，切点对齐到附近的静音处，不会把一句话切成两半
+- **✂️ 智能分段**：长视频自动按约 20 分钟分段，切点对齐到附近的说话停顿处，不会把一句话切成两半；配置了 VAD 模型时用 Silero VAD 找停顿，有背景音乐或噪声也能找准
 - **🌐 高质量翻译**：默认使用 `gemini-3.8-flash`，结构化 JSON 输出，携带上下文翻译，自动纠正语音识别错误
 - **🛡️ 健壮可靠**：失败自动重试与退避、问题句子自动隔离、密钥/模型错误提前发现；中途失败或中断也会保留已生成的部分字幕
 - **🧹 清理识别噪声**：过滤 `[BLANK_AUDIO]`、`(Music)` 等标记和 whisper 的重复"幻觉"句子，修正重叠的时间轴
@@ -21,7 +21,7 @@ v2srt 使用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在本地识
 |---|---|
 | [uv](https://docs.astral.sh/uv/) | Python 项目与依赖管理工具（会自动安装合适的 Python） |
 | [FFmpeg](https://ffmpeg.org/download.html) | 提取与切分音频，需要 `ffmpeg` 和 `ffprobe` |
-| [whisper.cpp](https://github.com/ggml-org/whisper.cpp/releases) | 使用其中的 `whisper-cli` 程序；Windows 有 NVIDIA 显卡建议下载 CUDA 版本 |
+| [whisper.cpp](https://github.com/ggml-org/whisper.cpp/releases) | 使用其中的 `whisper-cli` 程序，以及同目录下的 `whisper-vad-speech-segments`（用于寻找分段切点，官方 Windows 压缩包和 Homebrew 都自带）；Windows 有 NVIDIA 显卡建议下载 CUDA 版本 |
 | Whisper 模型 | 从 [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main) 下载，推荐 `ggml-large-v3-turbo.bin`（速度与准确率兼顾）；显存不足可选 `ggml-medium.bin` / `ggml-small.bin` |
 | VAD 模型（可选，推荐） | 从 [ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad/tree/main) 下载 Silero VAD 模型，可减少静音段的错误识别 |
 | Gemini API 密钥（可选） | 用于翻译，在 [Google AI Studio](https://aistudio.google.com/apikey) 获取；不配置则只生成原文字幕 |
@@ -137,7 +137,7 @@ v2srt --cut 1:00:00 2:00:00 long_video.mp4
 | `V2SRT_FFPROBE` | | 与 ffmpeg 同目录 | ffprobe 路径 |
 | `V2SRT_WHISPER_CLI` | | `whisper-cli` | whisper-cli 路径、所在目录或命令名 |
 | `V2SRT_WHISPER_MODEL` | `-m` | （必填） | whisper 模型文件 |
-| `V2SRT_VAD_MODEL` | `--vad-model` / `--no-vad` | | VAD 模型文件 |
+| `V2SRT_VAD_MODEL` | `--vad-model` / `--no-vad` | | VAD 模型文件，也用于寻找分段切点 |
 | `V2SRT_VAD_THRESHOLD` | | `0.3` | VAD 阈值，越低越容易判定为人声 |
 | `V2SRT_LANGUAGE` | `-l` | `auto` | 语音语言 |
 | `V2SRT_SEGMENT` | `--segment` | `20m` | 自动分段长度，`0` 表示不分段 |
@@ -193,7 +193,7 @@ v2srt clean --yes      # 不询问直接删除
 ## 🔧 工作原理
 
 ```
-ffmpeg ─► 16kHz 音频 ─► 按静音点分段 ─► whisper-cli（可多进程并行，逐行流式读取）
+ffmpeg ─► 16kHz 音频 ─► 按停顿点分段 ─► whisper-cli（可多进程并行，逐行流式读取）
                                               │ 每识别出一句
                                               ▼
                                    攒成小批 ─► Gemini（多线程并发）
@@ -204,6 +204,7 @@ ffmpeg ─► 16kHz 音频 ─► 按静音点分段 ─► whisper-cli（可多
 
 - whisper-cli 每解码出一句就会输出到 stdout，v2srt 逐行解析；一个分段（约 20 分钟）识别完成后，整段字幕按批（默认 40 条）提交翻译，同时开始识别下一段。
 - **补漏识别**：开启 VAD 时，whisper.cpp 会把一个分段里的所有人声拼接后连续解码，人声稀疏时偶尔会整段漏识别。每个分段识别完后，v2srt 会找出 VAD 检测到人声、却没有任何字幕的片段，在一次 whisper-cli 调用中逐个单独识别（模型只加载一次），再合并回去。补出来的"嗯""是"这类附和、重复音节和常见套话幻觉会被丢弃。这一步只处理漏掉的片段，额外耗时通常不多。
+- **分段切点**：超过约 25 分钟的音频会切成约 20 分钟的分段，每个切点移到附近最合适的停顿处。配置了 VAD 模型时，v2srt 先用 whisper.cpp 自带的 `whisper-vad-speech-segments`（与 `whisper-cli` 放在同一目录）和同一个 Silero 模型找出整段音频里的人声，取人声之间的空隙作为候选切点，有背景音乐或噪声时也能找到句间停顿；没有 VAD 模型、找不到这个程序或它运行失败时，改用 ffmpeg 的静音检测（固定 -35 dB 阈值，音乐声较大时可能找不到静音）。`v2srt check` 会显示是否找到了该程序。
 - 每批翻译都会附带前几句原文和已有译文作为上下文，保证人名与语气前后一致。
 - 翻译结果可能乱序返回，由有序汇合器按时间顺序写入文件。
 - 字幕先写入 `xxx.srt.part`，全部成功后才替换为 `xxx.srt`，不会留下半成品；失败或按 Ctrl+C 中断时会保留 `.part` 文件。

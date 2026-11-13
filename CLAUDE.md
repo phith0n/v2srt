@@ -27,7 +27,7 @@ Entry point `v2srt:main` → `cli.main`, which dispatches `run` (default), `init
 ### Processing pipeline (`pipeline.py`)
 
 ```
-ffmpeg → audio.wav → split at silences (media.plan_boundaries/split_wav) → one chunk per segment
+ffmpeg → audio.wav → split at pauses (vad.SpeechDetector or Media.detect_silences → media.plan_boundaries/split_wav) → one chunk per segment
   Whisper.recognize per chunk (DaemonExecutor, settings.whisper_jobs): main whisper-cli pass with --vad,
     stdout parsed line by line → CueCleaner → gap filling (whisper.py) → the chunk's cues, sorted
     → batches of batch_size, submitted once the chunk is complete
@@ -39,6 +39,7 @@ Key invariants that span several files:
 
 - **Streaming**: whisper-cli prints each segment to stdout as `[hh:mm:ss.mmm --> hh:mm:ss.mmm]  text`; `Whisper.transcribe` yields cues while the process runs. Language detection, progress and the VAD speech segments (`ChunkInfo`) come from **stderr**, so never add `--no-prints`. Chunk-relative timestamps are offset by `chunk.start`. Translation overlaps recognition **per chunk**: `recognize` returns a chunk's complete cue list, so the pipeline never has to retract cues it already submitted.
 - **Gap filling** (`Whisper.recognize`, `V2SRT_GAP_FILL`): with `--vad`, whisper.cpp concatenates a chunk's speech and decodes it as one stream; on sparse speech it sometimes returns almost nothing for a whole chunk. After the main pass, VAD segments not touched by any kept cue (±`COVER_PAD_MS`, using capped ends) are grouped by `plan_pieces`, cut with `wave`, transcribed **without** VAD in one whisper-cli call with several `-f` and `-osrt` (model loaded once; results read from `<piece>.wav.srt`), cleaned with `CueCleaner(strict=True)` (drops backchannel, syllable loops, stock phrases) and merged. Changing this behaviour should be validated on real files with the uncovered-speech metric (VAD speech time without a cue).
+- **Split points** (`Pipeline._pauses`, only when the audio will be split): with VAD enabled and `whisper-vad-speech-segments` found next to whisper-cli (`vad.find_vad_tool`), the whole audio.wav is run through it with the same Silero model and threshold; its stdout times are **centiseconds** (whisper.cpp's README example shows seconds and is outdated; `tests/data/vad-speech-segments.out` is real output). Gaps between speech of ≥ `MIN_PAUSE_MS` become the `(start, end)` pauses `plan_boundaries` consumes. Any `ToolError`, no speech at all, or a missing tool falls back to ffmpeg `silencedetect`; `Cancelled` propagates. The tool exits 0 on bad arguments, so the `Detected N speech segments:` header is required.
 - **Ordering**: batches finish out of order. `OrderedSink` is keyed by `(chunk, batch)` and only advances to the next chunk after `finish_chunk(chunk, n_batches)`; every submitted batch must eventually be `put`, even on failure (see the `finally` in `translate_batch`), or the sink stalls.
 - **CueSequencer** holds back one cue to trim overlaps, so `flush()` must run before committing.
 - **Outputs** write to `<name>.srt.part` and `os.replace` on success; on failure/Ctrl+C the `.part` file is kept and reported.
@@ -69,6 +70,7 @@ Key invariants that span several files:
 
 ### Testing doubles
 
+- `tests/fake_vad.py` imitates whisper-vad-speech-segments (speech = frames louder than `--vad-threshold`); `FAKE_VAD_FAIL` / `FAKE_VAD_USAGE` / `FAKE_VAD_REPLAY` control it. Inject via `SpeechDetector(..., command_prefix=[sys.executable, fake_vad.py])`.
 - `tests/fake_whisper.py` imitates whisper-cli's stdout/stderr; tests inject it via `Whisper(..., command_prefix=[sys.executable, fake_whisper.py])`. Env vars `FAKE_WHISPER_FAIL` / `FAKE_WHISPER_DELAY` control it.
 - `tests/fakes.py` provides `FakeClient` (Gemini) whose `behaviour(call_number, cues)` callback can raise `api_error(...)` or return partial answers.
 

@@ -29,13 +29,14 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
 from .config import Settings, language_base
-from .errors import ConfigError, V2SRTError
+from .errors import ConfigError, ToolError, V2SRTError
 from .media import Chunk, Media, plan_boundaries, split_wav
 from .proc import DaemonExecutor, ProcessGroup
 from .subtitle import Cue, CueSequencer, OutputMode, SrtWriter, parse_srt
 from .timeutil import format_clock
 from .translator import GeminiTranslator
 from .ui import Reporter
+from .vad import MIN_PAUSE_MS, SpeechDetector, speech_to_pauses
 from .whisper import Whisper
 
 log = logging.getLogger(__name__)
@@ -147,6 +148,7 @@ class Pipeline:
         media: Media | None = None,
         whisper: Whisper | None = None,
         translator: GeminiTranslator | None = None,
+        speech: SpeechDetector | None = None,
     ):
         self.settings = settings
         self.reporter = reporter
@@ -154,6 +156,7 @@ class Pipeline:
         self.media = media
         self.whisper = whisper
         self.translator = translator
+        self.speech = speech  # VAD for choosing split points; None: ffmpeg silencedetect only
 
     # ------------------------------------------------------------------ jobs
 
@@ -181,8 +184,7 @@ class Pipeline:
             silences = None
             s = self.settings
             if not s.cut_ms and s.segment_ms > 0 and duration > s.segment_ms * 1.25:
-                with self.reporter.stage("Silences", duration) as update:
-                    silences = self.media.detect_silences(wav, on_progress=update)
+                silences = self._pauses(wav, duration)
             boundaries = plan_boundaries(duration, segment_ms=s.segment_ms, cut_ms=s.cut_ms, silences=silences)
             chunks = split_wav(wav, boundaries, tmp)
             if len(chunks) > 1:
@@ -241,6 +243,31 @@ class Pipeline:
         return JobResult(output, None, outputs.count, untranslated, language, time.monotonic() - started)
 
     # -------------------------------------------------------------- internals
+
+    def _pauses(self, wav: Path, duration: int) -> list[tuple[int, int]]:
+        """Where the audio may be split: pauses between speech found by VAD, else silences found by ffmpeg."""
+        assert self.media is not None
+        if self.speech is not None:
+            speech = None
+            with self.reporter.stage("VAD", duration, indeterminate=True):
+                try:
+                    speech = self.speech.detect(wav, duration)
+                except ToolError as e:
+                    lines = [line.strip() for line in str(e).splitlines() if line.strip()]
+                    reason = lines[0].rstrip(":") + (f" ({lines[-1]})" if len(lines) > 1 else "")
+                    log.info("speech detection failed, splitting at silences instead: %s", reason)
+                    log.debug("speech detection error: %s", e)
+            if speech:
+                pauses = speech_to_pauses(speech, duration)
+                log.debug(
+                    "VAD: %d speech segments (%s of speech), %d pauses of at least %.1f s",
+                    len(speech), format_clock(sum(e - s for s, e in speech)), len(pauses), MIN_PAUSE_MS / 1000,
+                )  # fmt: skip
+                return pauses
+            if speech is not None:
+                log.info("VAD found no speech, splitting at silences instead")
+        with self.reporter.stage("Silences", duration) as update:
+            return self.media.detect_silences(wav, on_progress=update)
 
     def _job_translator(self) -> GeminiTranslator | None:
         t = self.translator

@@ -72,10 +72,15 @@ class Reporter:
             self._progress = None
 
     @contextmanager
-    def stage(self, description: str, total_ms: int | None) -> Iterator[Callable[[int], None]]:
-        """A simple time-based stage (audio extraction, silence detection)."""
+    def stage(
+        self, description: str, total_ms: int | None, *, indeterminate: bool = False
+    ) -> Iterator[Callable[[int], None]]:
+        """A simple time-based stage (audio extraction, silence detection).
+
+        ``indeterminate`` shows a pulsing bar for tools that report no progress; ``total_ms`` is shown when done.
+        """
         assert self._progress is not None
-        task = self._progress.add_task(description, total=total_ms or None, unit="ms")
+        task = self._progress.add_task(description, total=None if indeterminate else total_ms or None, unit="ms")
 
         def update(position_ms: int) -> None:
             self._progress.update(task, completed=min(position_ms, total_ms or position_ms))

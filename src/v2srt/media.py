@@ -144,8 +144,11 @@ def plan_boundaries(
     """Choose split points (ms) for the audio.
 
     Explicit cut points are used as-is. Otherwise the audio is divided into roughly equal segments of about
-    ``segment_ms`` and every split point is moved to the most suitable nearby silence, so no sentence is cut
-    in half.
+    ``segment_ms`` and every split point is moved to the most suitable nearby silence (or pause between speech),
+    so no sentence is cut in half.
+
+    Within a silence the split point is its middle, or for long silences (music, an intro) the point closest to
+    the target that stays at least 1 s away from either edge.
     """
     if cut_ms:
         return sorted({c for c in cut_ms if 0 < c < duration_ms})
@@ -158,13 +161,15 @@ def plan_boundaries(
     for k in range(1, count):
         target = duration_ms * k // count
         best = target
-        candidates = [
-            (s, e) for s, e in (silences or []) if abs((s + e) // 2 - target) <= window and (s + e) // 2 > 0
-        ]
+        candidates = []  # (length, point)
+        for s, e in silences or []:
+            margin = min((e - s) // 2, 1000)
+            point = min(max(target, s + margin), e - margin)
+            if abs(point - target) <= window and 0 < point < duration_ms:
+                candidates.append((e - s, point))
         if candidates:
             # Prefer long silences (capped, a 5s pause is not better than a 2s one), then closeness.
-            s, e = min(candidates, key=lambda c: (-min(c[1] - c[0], 2000), abs((c[0] + c[1]) // 2 - target)))
-            best = (s + e) // 2
+            best = min(candidates, key=lambda c: (-min(c[0], 2000), abs(c[1] - target)))[1]
         if not boundaries or best > boundaries[-1] + 1000:
             boundaries.append(best)
     return boundaries
