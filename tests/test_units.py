@@ -1,16 +1,19 @@
+import io
 import sys
 import wave
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from v2srt.config import Settings, language_base, language_name, settings_from_env, split_args
 from v2srt.errors import ConfigError
-from v2srt.media import Chunk, plan_boundaries
-from v2srt.pipeline import OrderedSink
+from v2srt.media import NORMALIZE_FILTER, Chunk, Media, MediaInfo, plan_boundaries
+from v2srt.pipeline import OrderedSink, Pipeline
 from v2srt.proc import ProcessGroup
 from v2srt.subtitle import Cue, CueCleaner, CueSequencer, OutputMode, cue_body, max_display_ms, parse_srt
 from v2srt.timeutil import format_clock, format_srt_time, parse_duration
+from v2srt.ui import Reporter
 from v2srt.whisper import ChunkInfo, Whisper, parse_segment_line, parse_vad_segment, plan_pieces, uncovered_speech
 
 
@@ -298,3 +301,105 @@ def test_env_example_matches_template():
 
     example = Path(__file__).parent.parent / ".env.example"
     assert example.read_text(encoding="utf-8") == ENV_TEMPLATE, "regenerate .env.example from ENV_TEMPLATE"
+
+
+# ------------------------------------------------------------------ loudness normalization
+
+
+class _RecordingProcs:
+    """Stands in for ProcessGroup: records the commands and prints ffmpeg-style progress."""
+
+    def __init__(self):
+        self.commands: list[list[str]] = []
+
+    def stream(self, cmd, *, on_stderr=None, name=None):
+        self.commands.append(list(cmd))
+        yield "out_time_us=1500000"
+        yield "progress=end"
+
+
+def test_normalize_filter_only_in_normalize_command(tmp_path):
+    procs = _RecordingProcs()
+    media = Media("ffmpeg", "ffprobe", procs)
+    progress: list[int] = []
+    media.extract_audio(tmp_path / "in.mkv", tmp_path / "audio.wav", audio_track=1, on_progress=progress.append)
+    media.normalize_audio(tmp_path / "audio.wav", tmp_path / "audio-norm.wav", on_progress=progress.append)
+    extract, normalize = procs.commands
+
+    assert not any("dynaudnorm" in arg for arg in extract)
+    assert extract[extract.index("-af") + 1] == "aresample=async=1"
+    assert extract[extract.index("-map") + 1] == "0:a:1"
+    assert normalize[normalize.index("-i") + 1] == str(tmp_path / "audio.wav")
+    assert normalize[normalize.index("-af") + 1] == NORMALIZE_FILTER
+    for cmd in (extract, normalize):  # both produce what whisper-cli expects
+        assert cmd[cmd.index("-ar") + 1] == "16000" and cmd[cmd.index("-ac") + 1] == "1"
+        assert cmd[cmd.index("-c:a") + 1] == "pcm_s16le"
+    assert normalize[-1] == str(tmp_path / "audio-norm.wav")
+    assert progress == [1500, 1500]
+
+    options = dict(kv.split("=") for kv in NORMALIZE_FILTER.removeprefix("dynaudnorm=").split(":"))
+    assert float(options["m"]) == 10 and float(options["p"]) < 1  # at most +20 dB, never clipping
+    assert int(options["g"]) % 2 == 1  # ffmpeg requires an odd gauss size
+
+
+def _pipeline_with_fake_media(tmp_path, monkeypatch, **settings):
+    """A pipeline whose ffmpeg steps are done in Python, recording which file each step reads."""
+    import v2srt.pipeline as pipeline_module
+
+    calls: list[str] = []
+
+    class FakeMedia(Media):
+        def probe(self, path):
+            return MediaInfo(duration_ms=70_000, audio_streams=1)
+
+        def extract_audio(self, src, dst, *, audio_track=None, on_progress=None):
+            calls.append(f"extract -> {dst.name}")
+            with wave.open(str(dst), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16_000)
+                w.writeframes(bytes(2 * 16_000 * 70))
+
+        def detect_silences(self, wav, **kwargs):
+            calls.append(f"silences {wav.name}")
+            return [(10_000, 11_000), (33_000, 34_000)]
+
+        def normalize_audio(self, src, dst, *, on_progress=None):
+            calls.append(f"normalize {src.name} -> {dst.name}")
+            dst.write_bytes(src.read_bytes())
+
+    real_split = pipeline_module.split_wav
+
+    def split_wav(wav, boundaries, out_dir):
+        calls.append(f"split {wav.name} at {boundaries} (raw kept: {(out_dir / 'audio.wav').exists()})")
+        return real_split(wav, boundaries, out_dir)
+
+    monkeypatch.setattr(pipeline_module, "split_wav", split_wav)
+    model = tmp_path / "ggml-fake.bin"
+    model.write_bytes(b"0")
+    s = Settings(whisper_model=str(model), segment_ms=30_000, **settings)
+    procs = ProcessGroup()
+    fake = Path(__file__).with_name("fake_whisper.py")
+    whisper = Whisper(s, "unused", procs, command_prefix=[sys.executable, str(fake)])
+    reporter = Reporter(Console(file=io.StringIO(), width=120))
+    pipeline = Pipeline(s, reporter, procs=procs, media=FakeMedia("ffmpeg", "ffprobe", procs), whisper=whisper)
+    return pipeline, calls
+
+
+def test_pipeline_normalizes_after_silence_detection(tmp_path, monkeypatch):
+    pipeline, calls = _pipeline_with_fake_media(tmp_path, monkeypatch, normalize=True)
+    result = pipeline.run_media(tmp_path / "clip.mkv", tmp_path / "clip.srt")
+    assert calls == [
+        "extract -> audio.wav",
+        "silences audio.wav",  # split points come from the original levels
+        "normalize audio.wav -> audio-norm.wav",
+        # whisper only sees the leveled audio, split where the original was silent; the raw copy is gone
+        "split audio-norm.wav at [33500] (raw kept: False)",
+    ]
+    assert result.cues > 20
+
+
+def test_pipeline_without_normalize(tmp_path, monkeypatch):
+    pipeline, calls = _pipeline_with_fake_media(tmp_path, monkeypatch)
+    pipeline.run_media(tmp_path / "clip.mkv", tmp_path / "clip.srt")
+    assert calls == ["extract -> audio.wav", "silences audio.wav", "split audio.wav at [33500] (raw kept: True)"]

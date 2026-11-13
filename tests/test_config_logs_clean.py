@@ -94,6 +94,20 @@ def test_log_dir_setting():
     assert resolve_log_dir(None) is not None
 
 
+def test_normalize_setting(home):
+    assert load_config(environ={}).settings.normalize is False  # off until validated on real recordings
+    config = load_config(environ={"V2SRT_NORMALIZE": "true"})
+    assert config.settings.normalize is True and config.sources["normalize"] == "environment (V2SRT_NORMALIZE)"
+
+    parser = cli.build_run_parser()
+    assert parser.parse_args(["a.mp4"]).normalize is None  # not given: the environment / file decides
+    assert parser.parse_args(["a.mp4", "--normalize"]).normalize is True
+    off = parser.parse_args(["a.mp4", "--no-normalize"]).normalize
+    assert off is False
+    config = load_config(environ={"V2SRT_NORMALIZE": "true"}, overrides={"normalize": off})
+    assert config.settings.normalize is False and config.sources["normalize"] == "command line"
+
+
 # ------------------------------------------------------------------ logs
 
 

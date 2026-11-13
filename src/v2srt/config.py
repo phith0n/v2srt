@@ -177,6 +177,7 @@ class Settings:
     whisper_args: list[str] = field(default_factory=list)
     segment_ms: int = 20 * 60_000
     gap_fill: bool = True
+    normalize: bool = False
     cut_ms: list[int] = field(default_factory=list)
     audio_track: int | None = None
     # translation
@@ -231,6 +232,7 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar("whisper_args", ("V2SRT_WHISPER_ARGS",), split_args),
     EnvVar("segment_ms", ("V2SRT_SEGMENT",), parse_duration),
     EnvVar("gap_fill", ("V2SRT_GAP_FILL",), _bool),
+    EnvVar("normalize", ("V2SRT_NORMALIZE",), _bool),
     EnvVar("cut_ms", ("V2SRT_CUT",), _cuts),
     EnvVar("translate", ("V2SRT_TRANSLATE",), _bool),
     EnvVar("gemini_api_key", ("V2SRT_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"), _text, secret=True),
@@ -336,6 +338,9 @@ V2SRT_VAD_MODEL=
 # With VAD, re-transcribe speech regions that got no subtitles (whisper sometimes drops
 # whole stretches of sparse speech). Short backchannel from this pass is discarded.
 # V2SRT_GAP_FILL=true
+# Level the loudness before recognition (up to +20 dB, never clipping) so that quiet
+# speech is not skipped by VAD. Experimental: not yet validated on real recordings.
+# V2SRT_NORMALIZE=false
 # V2SRT_WHISPER_THREADS=
 # Initial prompt, useful for names and jargon.
 # V2SRT_WHISPER_PROMPT=
