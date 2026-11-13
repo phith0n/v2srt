@@ -20,7 +20,17 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from . import __version__
-from .config import ENV_TEMPLATE, LOG_OFF, LoadedConfig, Settings, language_name, load_config, user_config_dir
+from .config import (
+    ENV_TEMPLATE,
+    LOG_OFF,
+    LoadedConfig,
+    Settings,
+    language_name,
+    load_config,
+    user_config_dir,
+    vad_max_speech,
+    vad_ms,
+)
 from .errors import Cancelled, ConfigError, V2SRTError
 from .logs import RunLog, default_log_dir, log_files, resolve_log_dir
 from .media import Media, resolve_executable, resolve_ffprobe
@@ -64,6 +74,20 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _vad_ms(value: str) -> int:
+    try:
+        return vad_ms(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _vad_max_speech(value: str) -> float:
+    try:
+        return vad_max_speech(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def _env_file_option(parser: Any) -> None:
     parser.add_argument(
         "--env-file", type=Path, metavar="PATH", help="use this configuration file instead of ./.env or the per-user one"
@@ -103,6 +127,14 @@ def build_run_parser(prog: str = "v2srt") -> argparse.ArgumentParser:
     g.add_argument("-m", "--model", dest="whisper_model", metavar="PATH", help="whisper.cpp ggml model")
     g.add_argument("--vad-model", metavar="PATH", help="Silero VAD model for whisper.cpp")
     g.add_argument("--no-vad", dest="use_vad", action="store_false", default=None, help="do not use VAD")
+    g.add_argument("--vad-min-speech", dest="vad_min_speech_ms", type=_vad_ms, metavar="MS",
+                   help="ignore speech shorter than this (whisper.cpp default 250)")  # fmt: skip
+    g.add_argument("--vad-min-silence", dest="vad_min_silence_ms", type=_vad_ms, metavar="MS",
+                   help="pause that ends a speech region (whisper.cpp default 100)")  # fmt: skip
+    g.add_argument("--vad-max-speech", dest="vad_max_speech_s", type=_vad_max_speech, metavar="SECONDS",
+                   help="split longer speech regions (whisper.cpp default: no limit)")  # fmt: skip
+    g.add_argument("--vad-speech-pad", dest="vad_speech_pad_ms", type=_vad_ms, metavar="MS",
+                   help="audio kept around each speech region (whisper.cpp default 30)")  # fmt: skip
     g.add_argument("--prompt", dest="whisper_prompt", metavar="TEXT", help="initial prompt (names, jargon)")
     g.add_argument(
         "--segment", dest="segment_ms", type=_duration, metavar="DURATION",

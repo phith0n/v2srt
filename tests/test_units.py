@@ -140,6 +140,50 @@ def test_recognize_without_gap_fill(tmp_path, monkeypatch):
     assert not any(c.text.startswith("Recovered") for c in whisper.recognize(Chunk(0, 0, 20_000, wav)))
 
 
+VAD_FLAGS = (
+    "--vad-min-speech-duration-ms",
+    "--vad-min-silence-duration-ms",
+    "--vad-max-speech-duration-s",
+    "--vad-speech-pad-ms",
+)
+
+
+def _flag_values(cmd: list[str]) -> dict[str, str]:
+    return {arg: cmd[i + 1] for i, arg in enumerate(cmd) if arg in VAD_FLAGS}
+
+
+def test_vad_options_are_passed_only_when_set(tmp_path):
+    whisper, wav = _fake_whisper(tmp_path, 1)
+    assert _flag_values(whisper.command(wav)) == {}  # whisper.cpp's defaults, works with any whisper-cli
+
+    whisper, wav = _fake_whisper(tmp_path, 1, vad_min_silence_ms=500, vad_max_speech_s=30.0)
+    cmd = whisper.command(wav)
+    assert _flag_values(cmd) == {"--vad-min-silence-duration-ms": "500", "--vad-max-speech-duration-s": "30.0"}
+    assert cmd.index("--vad-min-silence-duration-ms") > cmd.index("--vad")
+
+    whisper, wav = _fake_whisper(
+        tmp_path, 1, vad_min_speech_ms=0, vad_min_silence_ms=300, vad_max_speech_s=15.5, vad_speech_pad_ms=200
+    )
+    assert _flag_values(whisper.command(wav)) == {
+        "--vad-min-speech-duration-ms": "0",
+        "--vad-min-silence-duration-ms": "300",
+        "--vad-max-speech-duration-s": "15.5",
+        "--vad-speech-pad-ms": "200",
+    }
+    # the gap-filling pass runs without VAD, so none of the VAD flags may reach it
+    assert not any(arg.startswith("--vad") for arg in whisper.gap_command([wav], "en"))
+
+    whisper, wav = _fake_whisper(tmp_path, 1, use_vad=False, vad_min_silence_ms=300)
+    assert not any(arg.startswith("--vad") for arg in whisper.command(wav))
+
+
+def test_recognize_with_vad_options(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_WHISPER_DROP", "3")
+    whisper, wav = _fake_whisper(tmp_path, 20, vad_min_silence_ms=500, vad_speech_pad_ms=100)
+    cues = whisper.recognize(Chunk(0, 0, 20_000, wav))
+    assert any(c.text.startswith("Recovered") for c in cues)
+
+
 def test_parse_srt_lenient():
     text = "﻿1\r\n00:00:01,000 --> 00:00:02,500\r\nHello\r\nworld\r\n\r\n2\r\n00:00:03.000 --> 00:00:04.000\r\nAgain\r\n3\r\n00:00:05,000 --> 00:00:06,000\r\nNo blank line before\r\n"
     cues = parse_srt(text)
@@ -277,6 +321,53 @@ def test_settings_from_env():
 def test_settings_from_env_invalid():
     with pytest.raises(ConfigError, match="V2SRT_WHISPER_JOBS"):
         settings_from_env({"V2SRT_WHISPER_JOBS": "zero"})
+
+
+def test_vad_settings_from_env():
+    settings, _ = settings_from_env({})
+    assert (settings.vad_min_speech_ms, settings.vad_min_silence_ms, settings.vad_max_speech_s,
+            settings.vad_speech_pad_ms) == (None, None, None, None)  # fmt: skip
+    settings, sources = settings_from_env(
+        {
+            "V2SRT_VAD_MIN_SPEECH_MS": "0",
+            "V2SRT_VAD_MIN_SILENCE_MS": " 500 ",
+            "V2SRT_VAD_MAX_SPEECH_S": "15.5",
+            "V2SRT_VAD_SPEECH_PAD_MS": "",
+        }
+    )
+    assert settings.vad_min_speech_ms == 0 and settings.vad_min_silence_ms == 500
+    assert settings.vad_max_speech_s == 15.5
+    assert settings.vad_speech_pad_ms is None and "vad_speech_pad_ms" not in sources
+
+
+@pytest.mark.parametrize(
+    "name, value, message",
+    [
+        ("V2SRT_VAD_MIN_SPEECH_MS", "-1", "must not be negative"),
+        ("V2SRT_VAD_MIN_SILENCE_MS", "0.5", "expected whole milliseconds"),
+        ("V2SRT_VAD_SPEECH_PAD_MS", "30ms", "expected whole milliseconds"),
+        ("V2SRT_VAD_MAX_SPEECH_S", "0", "must be at least 1 second"),
+        ("V2SRT_VAD_MAX_SPEECH_S", "0.5", "must be at least 1 second"),
+        ("V2SRT_VAD_MAX_SPEECH_S", "inf", "must be at least 1 second"),
+        ("V2SRT_VAD_MAX_SPEECH_S", "nan", "must be at least 1 second"),
+        ("V2SRT_VAD_MAX_SPEECH_S", "30s", "expected seconds"),
+    ],
+)
+def test_vad_settings_invalid(name, value, message):
+    with pytest.raises(ConfigError, match=f"{name}: {message}"):
+        settings_from_env({name: value})
+
+
+def test_vad_cli_options(capsys):
+    from v2srt.cli import build_run_parser
+
+    parser = build_run_parser()
+    args = parser.parse_args(["in.mp4", "--vad-min-silence", "500", "--vad-max-speech", "30"])
+    assert args.vad_min_silence_ms == 500 and args.vad_max_speech_s == 30.0
+    assert args.vad_min_speech_ms is None and args.vad_speech_pad_ms is None  # not given -> not an override
+    with pytest.raises(SystemExit):
+        parser.parse_args(["in.mp4", "--vad-speech-pad", "-5"])
+    assert "must not be negative" in capsys.readouterr().err
 
 
 def test_split_args():

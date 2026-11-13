@@ -48,7 +48,9 @@ _SEGMENT_RE = re.compile(
 )
 _LANGUAGE_RE = re.compile(r"auto-detected language:\s*([A-Za-z-]+)")
 _PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)\s*%")
-# The raw segments; the later "whisper_vad: Including segment ..." lines add whisper's own padding.
+# whisper.cpp prints these after splitting (max speech duration), merging, dropping short speech and adding the
+# speech padding, i.e. exactly the regions that get decoded. The later "whisper_vad: Including segment ..." lines
+# repeat them with the samples overlap added and must not be counted again.
 _VAD_SEGMENT_RE = re.compile(r"VAD segment \d+: start = (\d+(?:\.\d+)?), end = (\d+(?:\.\d+)?)")
 
 
@@ -130,13 +132,31 @@ class Whisper:
             cmd += ["-t", str(s.whisper_threads)]
         if self.uses_vad:
             cmd += ["--vad", "--vad-model", s.vad_model, "--vad-threshold", str(s.vad_threshold)]
+            cmd += self.vad_options()
         if s.whisper_prompt:
             cmd += ["--prompt", s.whisper_prompt]
         cmd += [*s.whisper_args, "-f", str(wav)]
         return cmd
 
+    def vad_options(self) -> list[str]:
+        """The VAD tuning flags that are set; unset ones are left out so whisper-cli's defaults apply."""
+        s = self.settings
+        options = []
+        for flag, value in (
+            ("--vad-min-speech-duration-ms", s.vad_min_speech_ms),
+            ("--vad-min-silence-duration-ms", s.vad_min_silence_ms),
+            ("--vad-max-speech-duration-s", s.vad_max_speech_s),
+            ("--vad-speech-pad-ms", s.vad_speech_pad_ms),
+        ):
+            if value is not None:
+                options += [flag, str(value)]
+        return options
+
     def gap_command(self, wavs: list[Path], language: str) -> list[str]:
-        """Transcribe several short speech-only files in one process; each result goes to ``<file>.srt``."""
+        """Transcribe several short speech-only files in one process; each result goes to ``<file>.srt``.
+
+        No VAD (and so none of the VAD tuning flags): the pieces are speech already.
+        """
         s = self.settings
         cmd = [*self.prefix, "-m", s.whisper_model, "-l", language, "-osrt"]
         if s.whisper_threads:
